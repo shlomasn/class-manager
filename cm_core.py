@@ -12,6 +12,7 @@ import socket
 import tempfile
 import time
 import threading
+import uuid
 
 
 class OperationCancelled(RuntimeError):
@@ -450,6 +451,150 @@ def ensure_remote_directory(sftp, destination, reject_existing=False):
             sftp.mkdir(current, 0o700)
 
 
+class CommandControl(OperationControl):
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.stop_requested = threading.Event()
+
+    def request_stop(self):
+        self.stop_requested.set()
+
+    def check_connection(self):
+        super().check()
+
+    def check(self):
+        self.check_connection()
+        if self.stop_requested.is_set():
+            raise OperationCancelled('Команда отменена до запуска')
+
+
+def supervised_script(script, token):
+    """Run one Bash process group; stdin is a private stop channel, not user input."""
+    program = r'''import json, os, selectors, signal, subprocess, sys, time
+cfg = json.loads(CONFIG)
+if not all(hasattr(os, name) for name in ('waitid', 'WNOWAIT', 'P_PID')):
+    raise RuntimeError('Контроль процессов недоступен: команда не запущена')
+child = subprocess.Popen(['/bin/bash', '-c', cfg['script']], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+selector = selectors.DefaultSelector()
+selector.register(child.stdout, selectors.EVENT_READ, 'output')
+selector.register(child.stderr, selectors.EVENT_READ, 'output')
+selector.register(sys.stdin.buffer, selectors.EVENT_READ, 'control')
+pipes = 2
+pending = b''
+stopping = False
+killed = False
+stop_time = None
+confirmed = True
+output_open = True
+def emit(data):
+    global output_open
+    if output_open:
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except BrokenPipeError:
+            output_open = False
+
+def signal_group(sig):
+    global confirmed
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        confirmed = False
+
+def exited():
+    return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+try:
+    # WNOWAIT reserves the child's PID until all group signalling is finished.
+    while not exited() or pipes or (stopping and not killed):
+        now = time.monotonic()
+        if stopping and now - stop_time >= 3 and not killed:
+            signal_group(signal.SIGKILL)
+            killed = True
+        if stopping and now - stop_time >= 8:
+            confirmed = False
+            break
+        for key, mask in selector.select(.1):
+            data = os.read(key.fileobj.fileno(), 8192)
+            if not data:
+                selector.unregister(key.fileobj)
+                if key.data == 'output':
+                    pipes -= 1
+                continue
+            if key.data == 'output':
+                emit(data)
+            else:
+                pending += data
+                if len(pending) > 4096:
+                    raise RuntimeError('Invalid control message')
+                while b'\n' in pending:
+                    line, pending = pending.split(b'\n', 1)
+                    if line == ('CM_STOP_' + cfg['token']).encode('ascii') and not stopping:
+                        stopping, stop_time = True, time.monotonic()
+                        signal_group(signal.SIGTERM)
+    status = child.wait() if exited() else None
+    if status is None:
+        confirmed = False
+    result = dict(exit=status, cancelled=stopping, stop_confirmed=bool(stopping and confirmed and status is not None))
+    emit(('\nCM_RESULT_' + cfg['token'] + ':' + json.dumps(result) + '\n').encode('utf-8'))
+finally:
+    selector.close()
+'''
+    return program.replace('CONFIG', repr(json.dumps(dict(script=script, token=token))), 1)
+
+
+def run_managed(client, command, token, password, timeout, control, on_progress=None):
+    control.check()
+    channel = client.get_transport().open_session(timeout=8)
+    output = bytearray()
+    sent_stop = False
+    try:
+        control.check()
+        channel.exec_command(command)
+        if password is not None:
+            channel.sendall((password + '\n').encode('utf-8'))
+        started = time.monotonic()
+        deadline = started + timeout
+        last_progress = started - 1
+        while time.monotonic() < deadline:
+            control.check_connection()
+            now = time.monotonic()
+            if control.stop_requested.is_set() and not sent_stop:
+                channel.sendall(('CM_STOP_' + token + '\n').encode('ascii'))
+                sent_stop = True
+                deadline = now + 10
+            for ready, receive in ((channel.recv_ready, channel.recv), (channel.recv_stderr_ready, channel.recv_stderr)):
+                while ready():
+                    output.extend(receive(8192))
+                    if len(output) > 64 * 1024 + 1024:
+                        raise RuntimeError('Слишком большой ответ; результат требует проверки')
+            text = output.decode('utf-8', errors='replace')
+            marker = '\nCM_RESULT_' + token + ':'
+            visible = text.split(marker, 1)[0]
+            if len(visible.encode('utf-8')) > 64 * 1024:
+                raise RuntimeError('Слишком большой ответ; результат требует проверки')
+            if on_progress and now - last_progress >= .5:
+                on_progress(dict(elapsed=int(now - started), output=visible))
+                last_progress = now
+            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                code = channel.recv_exit_status()
+                if marker in text:
+                    raw = text.rsplit(marker, 1)[1].strip()
+                    status = json.loads(raw)
+                    if status['exit'] is not None:
+                        code = status['exit'] if status['exit'] >= 0 else 128 - status['exit']
+                    return code, visible, status
+                return code, text, None
+            time.sleep(.04)
+        raise RuntimeError('Остановка команды не подтверждена; проверьте ПК перед повтором' if sent_stop else 'Время ожидания истекло; результат не подтверждён. Проверьте ПК перед повтором')
+    finally:
+        channel.close()
+
+
 def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None, progress=None, control=None, access_gate=None):
     if not script.strip() or len(script.encode('utf-8')) > 32 * 1024 or '\x00' in script:
         raise ValueError('Введите команду длиной до 32 КБ без NUL')
@@ -484,7 +629,10 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
             if code != 0 or digest.split()[:1] != [expected_file['sha256']]:
                 raise RuntimeError('Переданный файл отсутствует или изменился; запуск отменён')
             result['expected_file'] = expected_file
-        command = ('LC_ALL=C sudo -k -S -p \'\' ' if sudo else '') + '/bin/bash -c ' + shlex.quote(script)
+        managed = isinstance(control, CommandControl)
+        token = uuid.uuid4().hex if managed else None
+        payload = ('/usr/bin/python3 -u -c ' + shlex.quote(supervised_script(script, token))) if managed else '/bin/bash -c ' + shlex.quote(script)
+        command = ('LC_ALL=C sudo -k -S -p \'\' ' if sudo else '') + payload
         if cwd is not None:
             command = '/bin/bash -c ' + shlex.quote('cd -- ' + shell_directory(cwd) + ' && ' + command)
         if access_gate:
@@ -492,18 +640,32 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
         notify('Выполняется')
         options = dict(password=password if sudo else None, timeout=timeout, **connection)
         if progress:
-            options['on_progress'] = lambda value: notify('Выполняется', value['elapsed'], value['output'])
-        code, output = run(client, command, **options)
+            options['on_progress'] = lambda value: notify('Остановка команды' if managed and control.stop_requested.is_set() else 'Выполняется', value['elapsed'], value['output'])
+        if managed:
+            code, output, status = run_managed(client, command, token, **options)
+        else:
+            code, output = run(client, command, **options)
+            status = None
         output = output.replace(password, '[СКРЫТО]')
         result.update(ok=code == 0, exit=code, output=output,
                       command=script.replace(password, '[СКРЫТО]'), sudo=sudo,
                       message='Команда завершена, код ' + str(code))
+        if managed and control.stop_requested.is_set():
+            result.update(stop_requested=True, stop_confirmed=False)
+        if managed and status is None and code == 0:
+            result.update(ok=False, message='Завершение команды не подтверждено; проверьте ПК перед повтором')
+        if status and status.get('cancelled'):
+            confirmed = bool(status.get('stop_confirmed'))
+            result.update(ok=False, cancelled=True, stop_confirmed=confirmed,
+                          message='Команда остановлена' if confirmed else 'Остановка команды не подтверждена; проверьте ПК перед повтором')
         if code == -1:
-            result['message'] = 'Соединение закрыто; результат команды не подтверждён'
+            result['message'] = 'Остановка команды не подтверждена; проверьте ПК перед повтором' if result.get('stop_requested') else 'Соединение закрыто; результат команды не подтверждён'
         if sudo and code != 0 and ('incorrect password' in output.lower() or 'authentication failure' in output.lower()):
             result.update(stop=True, message='Ошибка пароля sudo; дальнейшие попытки остановлены')
     except Exception as error:
         operation_error(result, error, password)
+        if isinstance(control, CommandControl) and control.stop_requested.is_set():
+            result.update(stop_requested=True, stop_confirmed=False)
     finally:
         if access_gate and result.get('stop'):
             access_gate.stopped.set()
@@ -759,19 +921,25 @@ class TransferAccessGate:
 
     def connect(self, host, pin, password, control=None):
         import paramiko
-        with self.lock:
+        effective = control or self.control
+        while not self.lock.acquire(timeout=.2):
+            self.check()
+            if effective:
+                effective.check()
+        try:
             self.check()
             try:
-                effective = control or self.control
                 if effective:
                     effective.check()
                 options = dict(control=effective) if effective else {}
                 return connect_verified(host, pin, password, **options)
             except paramiko.AuthenticationException:
                 if effective:
-                    effective.check()  # Closing one transfer is not a password failure.
+                    effective.check()  # A stop request is not a password failure.
                 self.stopped.set()
                 raise
+        finally:
+            self.lock.release()
 
 
 def prepare_transfer(path, progress=None):

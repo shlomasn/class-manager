@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -96,7 +96,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.8 — управление школьными компьютерами')
+        window.title('CM Astra 1.9 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -167,6 +167,7 @@ class Manager:
         remote.pack(fill='x', pady=(7, 0))
         self.button(remote, 'Запустить переданный файл…', self.launch_dialog)
         self.button(remote, 'Выполнить команду…', self.command_dialog)
+        self.button(remote, 'Остановить команды выбранным', self.stop_commands)
         self.button(remote, 'Результаты', self.show_results)
         delay_row = ttk.Frame(outer)
         delay_row.pack(fill='x', pady=(12, 12))
@@ -221,7 +222,7 @@ class Manager:
     def toggle(self, name):
         owners = getattr(getattr(self, 'operations', None), 'owners', {})
         operation = getattr(getattr(self, 'operations', None), 'active', {}).get(owners.get(name), {})
-        if name in owners and name not in self.selected and operation.get('action') != 'distribute':
+        if name in owners and name not in self.selected and operation.get('action') not in ('distribute', 'command'):
             messagebox.showinfo('Компьютер занят', name + ': дождитесь окончания его операции или выберите другой ПК.', parent=self.window)
             return
         if name in self.selected:
@@ -477,6 +478,35 @@ class Manager:
             self.selected.discard(name)
         self.refresh()
         self.summary.set('Отмена раздачи запрошена для ' + str(len(targets)) + ' ПК. Остальные операции продолжаются.')
+
+    def stop_commands(self):
+        targets = []
+        for host in self.visible():
+            if host.name not in self.selected:
+                continue
+            operation = self.operations.active.get(self.operations.owners.get(host.name), {})
+            control = operation.get('controls', {}).get(host.name)
+            if operation.get('action') == 'command' and isinstance(control, CommandControl) and not control.stop_requested.is_set():
+                targets.append((host.name, control))
+        if not targets:
+            messagebox.showinfo('Остановка команды', 'Отметьте ПК с выполняющейся командой, затем нажмите «Остановить команды выбранным».', parent=self.window)
+            return
+        text = ('Остановить команды на выбранных ПК?\n\n' + ', '.join(name for name, control in targets)
+                + '\n\nУстановка пакетов может остаться незавершённой. Остановка не откатывает изменения. '
+                  'Команды на остальных ПК продолжатся.')
+        if not messagebox.askokcancel('Остановка выбранных команд', text, icon='warning', default='cancel', parent=self.window):
+            return
+        requested = 0
+        for name, control in targets:
+            current = self.operations.active.get(self.operations.owners.get(name), {})
+            if current.get('controls', {}).get(name) is not control:
+                continue  # The command may have finished while confirmation was open.
+            requested += 1
+            control.request_stop()
+            self.statuses[name] = ('Остановка команды…', False)
+            self.selected.discard(name)
+        self.refresh()
+        self.summary.set('Остановка запрошена для ' + str(requested) + ' ПК. Ожидается подтверждение удалённых процессов.' if requested else 'Выбранные команды уже завершены.')
 
     def transferred_files(self):
         records = []
@@ -779,6 +809,8 @@ class Manager:
             return
         if action == 'distribute':
             operation['controls'] = {host.name: OperationControl(parent=self.shutdown, reason='Раздача отменена пользователем') for host in hosts}
+        elif action == 'command':
+            operation['controls'] = {host.name: CommandControl(parent=self.shutdown) for host in hosts}
         self.preparing_operation = operation['id']
         self.set_busy(True)
         self.summary.set('Проверка SSH без пароля…')
@@ -1021,13 +1053,15 @@ class Manager:
         self.summary.set('Раздача файлов: завершено ПК ' + str(complete) + '/' + str(len(state))
                          + '. Прогресс каждого ПК — в столбце «Состояние / результат».')
 
-    def send_commands(self, host_map, rows, password, job, events, control=None):
+    def send_commands(self, host_map, rows, password, job, events, control=None, host_controls=None):
         gate = TransferAccessGate(control)
-        options = dict(control=control) if control else {}
+        host_controls = host_controls or {}
         events.put(('command_waiting', [pin['name'] for pin in rows]))
         def worker(pin):
             name = pin['name']
             target = job.get('targets', {}).get(name, {})
+            worker_control = host_controls.get(name, control)
+            options = dict(control=worker_control) if worker_control else {}
             try:
                 result = execute_command(host_map[name], pin, password, job['script'], job['sudo'], job['timeout'],
                                          cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'),
@@ -1055,7 +1089,7 @@ class Manager:
             if action == 'distribute':
                 results.extend(self.distribute_files(host_map, rows, password, job, events, control, host_controls))
             if action == 'command':
-                results.extend(self.send_commands(host_map, rows, password, job, events, control))
+                results.extend(self.send_commands(host_map, rows, password, job, events, control, host_controls))
             for index, pin in enumerate([] if action in ('distribute', 'command') else rows):
                 if control:
                     control.check()
@@ -1126,10 +1160,15 @@ class Manager:
                 self.update_activity()
         elif kind == 'command_waiting':
             for name in value:
-                self.statuses[name] = ('Ожидает выполнения команды', False)
+                target_control = operation.get('controls', {}).get(name) if operation else None
+                stopping = isinstance(target_control, CommandControl) and target_control.stop_requested.is_set()
+                self.statuses[name] = ('Остановка команды…' if stopping else 'Ожидает выполнения команды', False)
             self.refresh()
         elif kind == 'command_progress':
             name = value['name']
+            target_control = operation.get('controls', {}).get(name) if operation else None
+            if isinstance(target_control, CommandControl) and target_control.stop_requested.is_set() and value['phase'] != 'Остановка команды':
+                return
             output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value['output'])
             lines = output.replace('\r', '\n').splitlines()
             latest = next((line.strip() for line in reversed(lines) if line.strip()), '')

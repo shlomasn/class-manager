@@ -960,5 +960,262 @@ class ConcurrentOperationsTests(unittest.TestCase):
             self.assertEqual(gate.connect(core.Host('a209-02', '', '209'), {}, 'secret', control=sibling), 'connected sibling')
         self.assertFalse(parent.cancelled.is_set())
 
+
+    def test_stop_selected_commands_requires_confirmation_and_preserves_other_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            operation = app.operations.start('command', app.hosts[:2], {})
+            operation['state'] = 'running'
+            operation['controls'] = {h.name: core.CommandControl(parent=app.shutdown) for h in app.hosts[:2]}
+            other = app.operations.start('distribute', app.hosts[2:], {})
+            app.table.focus = lambda name: None
+            app.toggle('a209-01')
+            with patch.object(gui.messagebox, 'askokcancel', return_value=False):
+                app.stop_commands()
+            self.assertFalse(operation['controls']['a209-01'].stop_requested.is_set())
+            with patch.object(gui.messagebox, 'askokcancel', return_value=True):
+                app.stop_commands()
+            self.assertTrue(operation['controls']['a209-01'].stop_requested.is_set())
+            self.assertFalse(operation['controls']['a209-02'].stop_requested.is_set())
+            self.assertFalse(app.shutdown.cancelled.is_set())
+            self.assertEqual(app.operations.owners['a209-01'], operation['id'])
+            app.handle_event('command_progress', dict(name='a209-01', phase='Выполняется', elapsed=1, output='late'), operation['id'])
+            self.assertIn('Остановка', app.statuses['a209-01'][0])
+            app.handle_event('result', dict(name='a209-01', action='command', ok=False, cancelled=True, stop_confirmed=True, message='Команда остановлена'), operation['id'])
+            self.assertNotIn('a209-01', app.operations.owners)
+            self.assertEqual(app.operations.owners['a209-02'], operation['id'])
+            self.assertEqual(app.operations.owners['a208-01'], other['id'])
+
+    def test_finishing_during_stop_confirmation_keeps_final_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            operation = app.operations.start('command', app.hosts[:1], {})
+            control = core.CommandControl(parent=app.shutdown)
+            operation['controls'] = {'a209-01': control}
+            app.selected = {'a209-01'}
+            def confirm(*args, **kwargs):
+                app.handle_event('result', dict(name='a209-01', action='command', ok=True, message='Команда завершена'), operation['id'])
+                return True
+            with patch.object(gui.messagebox, 'askokcancel', side_effect=confirm):
+                app.stop_commands()
+            self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
+            self.assertFalse(control.stop_requested.is_set())
+
+
+class ManagedCommandTests(unittest.TestCase):
+    def local_client(self):
+        import subprocess
+        import select
+        from unittest.mock import Mock
+        class Channel:
+            process = None
+            stdout_eof = stderr_eof = False
+            commands = []
+            sent = []
+            def exec_command(inner, command):
+                inner.commands.append(command)
+                import sys, shlex
+                local_command = command.replace('/usr/bin/python3', shlex.quote(sys.executable), 1)
+                inner.process = subprocess.Popen(['/bin/sh', '-c', local_command], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            def sendall(inner, data):
+                inner.sent.append(data)
+                inner.process.stdin.write(data)
+                inner.process.stdin.flush()
+            def recv_ready(inner):
+                return not inner.stdout_eof and bool(select.select([inner.process.stdout], [], [], 0)[0])
+            def recv_stderr_ready(inner):
+                return not inner.stderr_eof and bool(select.select([inner.process.stderr], [], [], 0)[0])
+            def recv(inner, size):
+                value = os.read(inner.process.stdout.fileno(), size)
+                if not value: inner.stdout_eof = True
+                return value
+            def recv_stderr(inner, size):
+                value = os.read(inner.process.stderr.fileno(), size)
+                if not value: inner.stderr_eof = True
+                return value
+            def exit_status_ready(inner): return inner.process.poll() is not None
+            def recv_exit_status(inner): return inner.process.wait()
+            def close(inner):
+                if inner.process:
+                    for stream in [inner.process.stdin, inner.process.stdout, inner.process.stderr]:
+                        if stream:
+                            try: stream.close()
+                            except OSError: pass
+                    if inner.process.poll() is None:
+                        inner.process.terminate()
+                        inner.process.wait(timeout=3)
+        channel = Channel()
+        client = types.SimpleNamespace(get_transport=lambda: types.SimpleNamespace(open_session=lambda **kw: channel), close=Mock())
+        return client, channel
+
+    def test_managed_command_normal_exit_preserves_output_and_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client, channel = self.local_client()
+            control = core.CommandControl()
+            with patch.object(core, 'connect_verified', return_value=client):
+                result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'pwd; printf done; exit 7', cwd=directory, control=control)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['exit'], 7)
+            self.assertIn(directory, result['output'])
+            self.assertIn('done', result['output'])
+            self.assertNotIn('CM_RESULT_', result['output'])
+            self.assertFalse(result.get('cancelled', False))
+            self.assertNotIn('secret', channel.commands[0])
+
+    def test_stop_terminates_process_group_and_preserves_other_command(self):
+        import threading
+        import shlex
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / 'group.pid'
+            client, channel = self.local_client()
+            control = core.CommandControl()
+            events, results = [], []
+            script = 'echo $$ > ' + shlex.quote(str(pidfile)) + "; trap '' TERM; sleep 60 & wait"
+            def execute():
+                with patch.object(core, 'connect_verified', return_value=client):
+                    results.append(core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', script, control=control, progress=events.append))
+            thread = threading.Thread(target=execute)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 3
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(pidfile.exists())
+                control.request_stop()
+                thread.join(12)
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(results[0].get('cancelled'), results)
+                self.assertTrue(results[0]['stop_confirmed'], results)
+                self.assertEqual(results[0]['message'], 'Команда остановлена')
+                self.assertTrue(any(event['phase'] == 'Остановка команды' for event in events))
+                group = int(pidfile.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(group, 0)
+                self.assertTrue(any(data.startswith(b'CM_STOP_') for data in channel.sent))
+                # A separate supervisor/client is unaffected by this stop request.
+                sibling_client, sibling_channel = self.local_client()
+                with patch.object(core, 'connect_verified', return_value=sibling_client):
+                    sibling = core.execute_command(core.Host('a209-02', '', '209'), dict(ip='192.168.22.2'), 'secret', 'printf sibling', control=core.CommandControl())
+                self.assertTrue(sibling['ok'], sibling)
+                self.assertEqual(sibling['output'], 'sibling')
+            finally:
+                if thread.is_alive():
+                    control.cancel()
+                    thread.join(2)
+                if pidfile.exists():
+                    try: os.killpg(int(pidfile.read_text()), 9)
+                    except ProcessLookupError: pass
+
+    def test_stopping_one_of_two_live_supervisors_does_not_stop_sibling(self):
+        import threading, time, shlex
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            ready, release = base / 'ready', base / 'release'
+            clients = [self.local_client()[0], self.local_client()[0]]
+            parent = core.OperationControl()
+            controls = [core.CommandControl(parent=parent), core.CommandControl(parent=parent)]
+            results = {}
+            scripts = ["printf target; trap '' TERM; sleep 60 & wait", 'touch ' + shlex.quote(str(ready)) + '; while [ ! -f ' + shlex.quote(str(release)) + ' ]; do sleep .05; done; printf sibling']
+            def connect(host, pin, password, **kwargs): return clients[int(host.name[-1]) - 1]
+            def execute(index):
+                results[index] = core.execute_command(core.Host('a209-0' + str(index + 1), '', '209'), dict(ip='192.168.22.1'), 'secret', scripts[index], control=controls[index])
+            threads = [threading.Thread(target=execute, args=(n,)) for n in range(2)]
+            with patch.object(core, 'connect_verified', connect):
+                for thread in threads: thread.start()
+                try:
+                    deadline = time.monotonic() + 3
+                    while not ready.exists() and time.monotonic() < deadline: time.sleep(.02)
+                    self.assertTrue(ready.exists())
+                    controls[0].request_stop()
+                    threads[0].join(12)
+                    self.assertFalse(threads[0].is_alive())
+                    self.assertTrue(results[0].get('stop_confirmed'), results)
+                    self.assertTrue(threads[1].is_alive())
+                    self.assertFalse(controls[1].stop_requested.is_set())
+                    self.assertFalse(parent.cancelled.is_set())
+                    release.touch()
+                    threads[1].join(3)
+                    self.assertTrue(results[1]['ok'], results)
+                    self.assertEqual(results[1]['output'], 'sibling')
+                finally:
+                    release.touch()
+                    for control in controls: control.request_stop()
+                    for thread in threads: thread.join(12)
+
+    def test_stop_confirmation_has_its_own_ten_second_deadline(self):
+        from unittest.mock import Mock
+        control = core.CommandControl()
+        clock = [0.0]
+        channel = types.SimpleNamespace(exec_command=lambda command: control.request_stop(), sendall=Mock(),
+                                        recv_ready=lambda: False, recv_stderr_ready=lambda: False,
+                                        recv=lambda size: b'', recv_stderr=lambda size: b'',
+                                        exit_status_ready=lambda: False, close=Mock())
+        client = types.SimpleNamespace(get_transport=lambda: types.SimpleNamespace(open_session=lambda **kw: channel))
+        def sleep(seconds): clock[0] += 1
+        with patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(core.time, 'sleep', side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, 'Остановка команды не подтверждена'):
+                core.run_managed(client, 'supervisor', 'token', None, 300, control)
+        self.assertLessEqual(clock[0], 10)
+        channel.sendall.assert_called_once_with(b'CM_STOP_token\n')
+        channel.close.assert_called_once()
+
+    def test_pending_authentication_can_be_stopped_without_waiting_for_other_host(self):
+        import threading
+        gate, control = core.TransferAccessGate(), core.CommandControl()
+        errors = []
+        def connect():
+            try:
+                gate.connect(core.Host('a209-01', '', '209'), {}, 'secret', control=control)
+            except core.OperationCancelled:
+                errors.append('cancelled')
+        gate.lock.acquire()
+        thread = threading.Thread(target=connect)
+        try:
+            with patch.object(core, 'connect_verified') as remote:
+                thread.start()
+                control.request_stop()
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+                remote.assert_not_called()
+            self.assertEqual(errors, ['cancelled'])
+        finally:
+            gate.lock.release()
+            thread.join(1)
+
+    def test_stop_before_start_never_connects_and_does_not_trip_password_gate(self):
+        control = core.CommandControl()
+        control.request_stop()
+        gate = core.TransferAccessGate()
+        with patch.object(core, 'connect_verified') as connect:
+            result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'id', control=control, access_gate=gate)
+        self.assertTrue(result['cancelled'])
+        self.assertFalse(result.get('stop', False))
+        self.assertFalse(gate.stopped.is_set())
+        connect.assert_not_called()
+
+    def test_disconnect_during_stop_is_not_reported_as_confirmed(self):
+        client = types.SimpleNamespace(close=lambda: None)
+        control = core.CommandControl()
+        with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run_managed', side_effect=RuntimeError('Связь потеряна; остановка не подтверждена')):
+            result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'sleep 10', control=control)
+        self.assertFalse(result['ok'])
+        self.assertFalse(result.get('stop_confirmed', False))
+        self.assertIn('не подтверждена', result['message'])
+
+    def test_sudo_supervisor_uses_stdin_password_and_user_directory(self):
+        client = types.SimpleNamespace(close=lambda: None)
+        control = core.CommandControl()
+        with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run_managed', return_value=(0, 'done', dict(exit=0, cancelled=False, stop_confirmed=False))) as run:
+            result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'id', sudo=True, cwd='~/lesson files', control=control)
+        self.assertTrue(result['ok'])
+        self.assertEqual(run.call_args.kwargs['password'], 'secret')
+        self.assertNotIn('secret', run.call_args.args[1])
+        import shlex
+        outer = shlex.split(run.call_args.args[1])[-1]
+        self.assertLess(outer.index('cd -- '), outer.index('sudo'))
+        self.assertIn('/usr/bin/python3 -u -c ', outer)
+
+
 if __name__ == '__main__':
     unittest.main()
