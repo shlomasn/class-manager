@@ -1,14 +1,14 @@
-CM Astra 1.3; 25.11.2026
+CM Astra 1.4; 25.11.2026
 ...................................
 ----------------------------------------------------------------------
-Ran 35 tests in 0.008s
+Ran 35 tests in 0.007s
 
 OK
 
-.........................
+...................................
 ----------------------------------------------------------------------
-Ran 25 tests in 0.022s
+Ran 35 tests in 0.690s
 
 OK
 
-Tests use fake SSH/SFTP and platform vault APIs. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.
+Tests use fake SSH/SFTP and platform vault APIs; downloader is additionally exercised with real local loopback HTTP and Python, not real school SSH forwarding. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.

@@ -113,6 +113,31 @@ class CommandTests(unittest.TestCase):
                 core.execute_command(self.host, self.pin, 'secret', 'id', cwd=value)
             connect.assert_not_called()
 
+    def test_selected_file_command_quotes_filename_and_sets_sudo(self):
+        import shlex
+        spec = core.file_launch_spec("/home/user/Desktops/Desktop1/CM-Inbox/setup ' $;.sh", 'a' * 64)
+        self.assertFalse(spec['sudo'])
+        self.assertEqual(shlex.split(spec['script']), ['/bin/bash', "./setup ' $;.sh"])
+        self.assertEqual(spec['cwd'], '/home/user/Desktops/Desktop1/CM-Inbox')
+        self.assertTrue(core.file_launch_spec('/home/user/a.deb', 'a' * 64)['sudo'])
+
+    def test_changed_transferred_file_blocks_execution(self):
+        client = types.SimpleNamespace(close=lambda: None)
+        spec = core.file_launch_spec('/home/user/setup.sh', 'a' * 64)
+        with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run', return_value=(0, 'b' * 64 + '  file')) as run:
+            result = core.execute_command(self.host, self.pin, 'secret', spec['script'], cwd=spec['cwd'], expected_file=spec['expected_file'])
+        self.assertFalse(result['ok'])
+        run.assert_called_once()
+        self.assertIn('запуск отменён', result['message'])
+
+    def test_matching_transferred_file_allows_execution(self):
+        client = types.SimpleNamespace(close=lambda: None)
+        spec = core.file_launch_spec('/home/user/setup.sh', 'a' * 64)
+        with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run', side_effect=[(0, 'a' * 64 + '  file'), (0, 'done')]) as run:
+            result = core.execute_command(self.host, self.pin, 'secret', spec['script'], cwd=spec['cwd'], expected_file=spec['expected_file'])
+        self.assertTrue(result['ok'])
+        self.assertEqual(run.call_count, 2)
+
 
 class UploadTests(unittest.TestCase):
     def setUp(self):
@@ -121,6 +146,8 @@ class UploadTests(unittest.TestCase):
         self.base = Path(self.temp.name).resolve()
         self.home = self.base / 'remote-home'
         self.home.mkdir()
+        self.inbox = self.home / 'Desktops/Desktop1/CM-Inbox'
+        self.inbox.parent.mkdir(parents=True)
         self.source = self.base / "app 'test';$.deb"
         self.source.write_bytes(b'package contents')
         outer = self
@@ -136,14 +163,17 @@ class UploadTests(unittest.TestCase):
                     Path(path).write_bytes(b'changed')
             def chmod(self, path, mode): Path(path).chmod(mode)
             def open(self, path, mode): return open(path, mode)
-            def rename(self, source, target): os.rename(source, target)
+            def rename(self, source, target):
+                if Path(target).exists(): raise FileExistsError(target)
+                os.rename(source, target)
+            def posix_rename(self, source, target): os.replace(source, target)
             def remove(self, path): Path(path).unlink()
             def close(self): pass
         self.client = types.SimpleNamespace(open_sftp=lambda: SFTP(), close=lambda: None)
 
-    def upload(self, destination=None, progress=None):
+    def upload(self, destination=None, progress=None, on_conflict=None):
         with patch.object(core, 'connect_verified', return_value=self.client):
-            return core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', [str(self.source)], 'batch-123', destination=destination, progress=progress)
+            return core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', [str(self.source)], 'batch-123', destination=destination, progress=progress, on_conflict=on_conflict)
 
     def test_files_hash_checked_and_not_executed(self):
         result = self.upload()
@@ -157,18 +187,18 @@ class UploadTests(unittest.TestCase):
         self.tamper = True
         result = self.upload()
         self.assertFalse(result['ok'])
-        self.assertFalse(list((self.home / 'CM-Inbox/batch-123').iterdir()))
+        self.assertFalse(list(self.inbox.iterdir()))
 
     def test_existing_batch_not_overwritten(self):
         self.assertTrue(self.upload()['ok'])
         result = self.upload()
         self.assertFalse(result['ok'])
-        self.assertEqual((self.home / 'CM-Inbox/batch-123' / self.source.name).read_bytes(), self.source.read_bytes())
+        self.assertEqual((self.inbox / self.source.name).read_bytes(), self.source.read_bytes())
 
     def test_symlink_parent_rejected(self):
         outside = self.base / 'outside'
         outside.mkdir()
-        (self.home / 'CM-Inbox').symlink_to(outside)
+        self.inbox.symlink_to(outside)
         self.assertFalse(self.upload()['ok'])
         self.assertFalse(list(outside.iterdir()))
 
@@ -208,6 +238,120 @@ class UploadTests(unittest.TestCase):
         (self.home / 'link').symlink_to(outside)
         self.assertFalse(self.upload('~/link/nested')['ok'])
         self.assertFalse(list(outside.iterdir()))
+
+    def test_overwrite_yes_and_no_preserve_or_replace_content(self):
+        self.assertTrue(self.upload()['ok'])
+        target = self.inbox / self.source.name
+        self.source.write_bytes(b'new contents')
+        prompts = []
+        result = self.upload(on_conflict=lambda path: prompts.append(path) or False)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['skipped'], [str(target)])
+        self.assertEqual(result['files'], [])
+        self.assertEqual(target.read_bytes(), b'package contents')
+        result = self.upload(on_conflict=lambda path: True)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(target.read_bytes(), b'new contents')
+        self.assertEqual(prompts, [str(target)])
+
+    def test_actual_downloader_through_forwarded_channel_and_overwrite(self):
+        import socket
+        import threading
+        import subprocess
+        class Transport:
+            listener = None
+            cancelled = False
+            def request_port_forward(inner, address, port, handler):
+                self.assertEqual((address, port), ('127.0.0.1', 0))
+                inner.listener = socket.socket()
+                inner.listener.bind((address, port))
+                inner.listener.listen()
+                inner.listener.settimeout(0.1)
+                listener = inner.listener
+                def accept():
+                    while inner.listener:
+                        try:
+                            channel, origin = listener.accept()
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            break
+                        handler(channel, origin, ('127.0.0.1', 0))
+                threading.Thread(target=accept, daemon=True).start()
+                return inner.listener.getsockname()[1]
+            def cancel_port_forward(inner, address, port):
+                inner.cancelled = True
+                listener, inner.listener = inner.listener, None
+                if listener:
+                    listener.close()
+        self.source.write_bytes(b'payload with spaces and quotes' * 30000)
+        def run(client, command, **kwargs):
+            result = subprocess.run(['/bin/sh', '-c', command], capture_output=True, text=True, timeout=20)
+            return result.returncode, result.stdout + result.stderr
+        def download(answer=None):
+            transport = Transport()
+            self.client.get_transport = lambda: transport
+            events = []
+            with patch.object(core, 'connect_verified', return_value=self.client), patch.object(core, 'run', run):
+                result = core.download_from_teacher(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'),
+                                                    'secret', str(self.source), progress=events.append,
+                                                    on_conflict=(lambda path: answer) if answer is not None else None)
+            return result, events, transport
+        result, events, transport = download()
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(transport.cancelled)
+        self.assertEqual(events[-1]['done'], events[-1]['total'])
+        target = Path(result['files'][0]['path'])
+        self.assertEqual(target, self.inbox / self.source.name)
+        self.assertEqual(target.read_bytes(), self.source.read_bytes())
+        self.source.write_bytes(b'replacement')
+        result, events, transport = download(False)
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['skipped'])
+        self.assertNotEqual(target.read_bytes(), b'replacement')
+        result, events, transport = download(True)
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(transport.cancelled)
+        self.assertEqual(target.read_bytes(), b'replacement')
+        self.assertFalse(list(self.inbox.glob('*.part')))
+
+    def test_download_hash_failure_preserves_existing_file(self):
+        import subprocess
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(inner):
+                inner.send_response(200)
+                inner.send_header('Content-Length', '5')
+                inner.end_headers()
+                inner.wfile.write(b'wrong')
+            def log_message(self, *args): pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.inbox.mkdir()
+            target = self.inbox / self.source.name
+            target.write_bytes(b'preserve')
+            script = core.download_script('http://127.0.0.1:' + str(server.server_port) + '/', str(self.inbox), self.source.name, '0' * 64, 5, True)
+            import sys
+            result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_bytes(), b'preserve')
+            self.assertFalse(list(self.inbox.glob('*.part')))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_download_forwarding_rejected_no_file_written(self):
+        transport = types.SimpleNamespace(request_port_forward=lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('denied')))
+        self.client.get_transport = lambda: transport
+        with patch.object(core, 'connect_verified', return_value=self.client), patch.object(core, 'run') as run:
+            result = core.download_from_teacher(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', str(self.source))
+        self.assertFalse(result['ok'])
+        self.assertIn('SSH-сервер', result['message'])
+        run.assert_not_called()
+        self.assertFalse(self.inbox.exists())
 
 
 class ScanIdentityTests(unittest.TestCase):
@@ -275,7 +419,8 @@ class DispatchTests(unittest.TestCase):
     def test_batch_dispatches_upload_and_commands_without_power_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             for action, function, job in [('upload', 'transfer_files', dict(files=['x'], batch='test')),
-                                          ('command', 'execute_command', dict(script='id', sudo=False, timeout=60))]:
+                                          ('command', 'execute_command', dict(script='id', sudo=False, timeout=60)),
+                                          ('download', 'download_from_teacher', dict(files=['x'], destination=core.DEFAULT_INBOX))]:
                 app = gui.Manager.__new__(gui.Manager)
                 app.data = Path(directory)
                 import queue
@@ -286,6 +431,63 @@ class DispatchTests(unittest.TestCase):
                     app.send({'a209-06': core.Host('a209-06', '', '209')}, [row], 'secret', action, 0, [], job)
                 target.assert_called_once()
                 power.assert_not_called()
+
+    def test_transferred_files_loaded_after_restart_with_per_host_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = gui.Manager.__new__(gui.Manager)
+            app.data = Path(directory)
+            app.last_results = []
+            report = app.data / 'reports/20261125-1.json'
+            rows = [dict(name=name, action=action, files=[dict(path=path, sha256='a' * 64)])
+                    for name, action, path in [('a209-01', 'upload', '/home/user/Desktops/Desktop1/CM-Inbox/run.sh'),
+                                               ('a209-02', 'download', '/home/user/lesson/run.sh')]]
+            core.atomic_json(report, rows)
+            groups = app.transferred_files()
+            targets = groups[('run.sh', 'a' * 64)]
+            self.assertEqual(targets['a209-01']['cwd'], '/home/user/Desktops/Desktop1/CM-Inbox')
+            self.assertEqual(targets['a209-02']['cwd'], '/home/user/lesson')
+            self.assertEqual(targets['a209-01']['script'], targets['a209-02']['script'])
+
+    def test_password_failure_stops_remaining_downloads(self):
+        import queue
+        with tempfile.TemporaryDirectory() as directory:
+            app = gui.Manager.__new__(gui.Manager)
+            app.data, app.events = Path(directory), queue.Queue()
+            rows = [dict(name='a209-01', ip='192.168.22.1'), dict(name='a209-02', ip='192.168.22.2')]
+            failed = dict(rows[0], ok=False, message='Ошибка доступа', stop=True, action='download')
+            with patch.object(gui, 'download_from_teacher', return_value=failed) as download:
+                app.send({r['name']: core.Host(r['name'], '', '209') for r in rows}, rows, 'secret', 'download', 0, [], dict(files=['x'], destination=core.DEFAULT_INBOX))
+            download.assert_called_once()
+            events = []
+            while not app.events.empty():
+                events.append(app.events.get())
+            results = [value for kind, value in events if kind == 'result']
+            self.assertEqual(len(results), 2)
+            self.assertIn('Пропущен', results[1]['message'])
+
+    def test_forwarded_http_channel_serves_only_selected_token(self):
+        class Channel:
+            def __init__(self, request):
+                self.request, self.output, self.closed = request, b'', False
+            def settimeout(self, timeout): pass
+            def recv(self, count):
+                result, self.request = self.request[:count], self.request[count:]
+                return result
+            def sendall(self, value): self.output += value
+            def close(self): self.closed = True
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'chosen.bin'
+            path.write_bytes(b'only this file')
+            wrong = Channel(b'GET /../another HTTP/1.1\r\n\r\n')
+            core._serve_file_channel(wrong, path, 'token', path.stat().st_size, lambda count: None)
+            self.assertIn(b'404', wrong.output)
+            self.assertNotIn(b'only this file', wrong.output)
+            correct = Channel(b'GET /token HTTP/1.1\r\n\r\n')
+            counts = []
+            core._serve_file_channel(correct, path, 'token', path.stat().st_size, counts.append)
+            self.assertEqual(correct.output.split(b'\r\n\r\n')[1], path.read_bytes())
+            self.assertEqual(sum(counts), path.stat().st_size)
+            self.assertTrue(correct.closed)
 
 
 if __name__ == '__main__':

@@ -5,13 +5,14 @@ import json
 import os
 from pathlib import Path
 import queue
+import posixpath
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, download_from_teacher
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -47,7 +48,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.3 — управление школьными компьютерами')
+        window.title('CM Astra 1.4 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -113,6 +114,10 @@ class Manager:
         remote = ttk.Frame(outer)
         remote.pack(fill='x', pady=(10, 0))
         self.button(remote, 'Передать файлы…', self.upload_dialog)
+        self.button(remote, 'Скачать файл учителя…', self.download_dialog)
+        remote = ttk.Frame(outer)
+        remote.pack(fill='x', pady=(7, 0))
+        self.button(remote, 'Запустить переданный файл…', self.launch_dialog)
         self.button(remote, 'Выполнить команду…', self.command_dialog)
         self.button(remote, 'Результаты', self.show_results)
         delay_row = ttk.Frame(outer)
@@ -375,8 +380,15 @@ class Manager:
         dialog.grab_set()
         self.window.wait_window(dialog)
 
-    def upload_dialog(self):
-        files = filedialog.askopenfilenames(parent=self.window, title='Программы и файлы для передачи (до 20 файлов)')
+    def download_dialog(self):
+        self.upload_dialog(download=True)
+
+    def upload_dialog(self, download=False):
+        if download:
+            path = filedialog.askopenfilename(parent=self.window, title='Какой файл выбранные ПК должны скачать с компьютера учителя?')
+            files = [path] if path else []
+        else:
+            files = filedialog.askopenfilenames(parent=self.window, title='Программы и файлы для передачи (до 20 файлов)')
         if not files:
             return
         if len(files) > 20:
@@ -387,9 +399,9 @@ class Manager:
             'Куда передать файлы на ученических ПК?',
             'Папка НА УЧЕНИЧЕСКИХ ПК (одинаковый путь для всех выбранных):\n'
             '~/ — домашняя папка user; можно указать /полный/путь.\n'
-            'Недостающие папки будут созданы. Существующие файлы не перезаписываются.\n'
+            'Недостающие папки будут созданы. При совпадении имени будет вопрос о перезаписи.\n'
             'Передача не запускает файлы. Права записи — у user.',
-            initialvalue='~/CM-Inbox/' + batch, parent=self.window)
+            initialvalue=DEFAULT_INBOX, parent=self.window)
         if destination is None:
             return
         try:
@@ -397,9 +409,73 @@ class Manager:
         except ValueError as error:
             messagebox.showerror('Папка назначения', str(error), parent=self.window)
             return
-        self.begin('upload', dict(files=list(files), batch=batch, destination=destination))
+        self.begin('download' if download else 'upload', dict(files=list(files), batch=batch, destination=destination))
 
-    def command_dialog(self):
+    def transferred_files(self):
+        records = []
+        for report in sorted((self.data / 'reports').glob('*.json'))[-100:]:
+            try:
+                rows = json.loads(report.read_text(encoding='utf-8'))
+                if isinstance(rows, list):
+                    records.extend(rows)
+            except (OSError, ValueError):
+                continue
+        records.extend(self.last_results)
+        groups = {}
+        for row in records:
+            if not isinstance(row, dict) or row.get('action') not in ('upload', 'download'):
+                continue
+            for item in row.get('files', []):
+                try:
+                    spec = file_launch_spec(item['path'], item['sha256'])
+                    name = posixpath.basename(item['path'])
+                    groups.setdefault((name, item['sha256']), {})[row['name']] = spec
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return groups
+
+    def launch_dialog(self):
+        selected = {h.name for h in self.visible() if h.name in self.selected}
+        if not selected:
+            messagebox.showinfo('Выберите компьютеры', 'Отметьте ПК, на которых нужно запустить переданный файл.', parent=self.window)
+            return
+        groups = [(key, targets) for key, targets in self.transferred_files().items() if selected.intersection(targets)]
+        if not groups:
+            messagebox.showinfo('Нет переданных файлов', 'Передайте .sh или .deb на выбранные ПК. Список берётся из последних 100 отчётов передачи.', parent=self.window)
+            return
+        dialog = tk.Toplevel(self.window)
+        dialog.title('Выбор переданного .sh или .deb')
+        dialog.transient(self.window)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='Выберите файл. Команда и папка будут подставлены; затем проверьте и подтвердите запуск.').pack(anchor='w')
+        labels = [key[0] + ' • SHA-256 ' + key[1][:12] + ' • ПК: ' + str(len(selected.intersection(targets))) + '/' + str(len(selected)) for key, targets in groups]
+        choice = ttk.Combobox(frame, values=labels, state='readonly', width=95)
+        choice.current(0)
+        choice.pack(fill='x', pady=10)
+        details = tk.StringVar()
+        def show_paths(event=None):
+            targets = groups[choice.current()][1]
+            details.set('\n'.join(name + ': ' + (targets[name]['expected_file']['path'] if name in targets else 'нет подтверждённой передачи') for name in sorted(selected)))
+        choice.bind('<<ComboboxSelected>>', show_paths)
+        ttk.Label(frame, textvariable=details, wraplength=850).pack(anchor='w')
+        show_paths()
+        def prepare():
+            targets = groups[choice.current()][1]
+            missing = sorted(selected.difference(targets))
+            if missing:
+                messagebox.showerror('Файл не передан на все выбранные ПК', 'Сначала передайте этот файл или снимите выбор: ' + ', '.join(missing), parent=dialog)
+                return
+            spec = targets[next(iter(selected))]
+            preset = dict(spec, targets={name: targets[name] for name in selected})
+            dialog.destroy()
+            self.command_dialog(preset)
+        ttk.Button(frame, text='Подготовить команду…', command=prepare).pack(side='right', pady=12)
+        ttk.Button(frame, text='Отмена', command=dialog.destroy).pack(side='left', pady=12)
+        dialog.grab_set()
+        self.window.wait_window(dialog)
+
+    def command_dialog(self, preset=None):
         dialog = tk.Toplevel(self.window)
         dialog.title('Команда на выбранных ПК Astra')
         dialog.transient(self.window)
@@ -407,18 +483,20 @@ class Manager:
         frame.pack(fill='both', expand=True)
         ttk.Label(frame, text='Введите команду Bash. Выполнение начнётся после выбора и подтверждения списка ПК.').pack(anchor='w')
         text = tk.Text(frame, width=85, height=10, wrap='word')
-        text.insert('1.0', 'hostname; uptime')
+        text.insert('1.0', preset['script'] if preset else 'hostname; uptime')
         text.pack(fill='both', expand=True, pady=10)
         ttk.Label(frame, text='Рабочая папка НА УЧЕНИЧЕСКИХ ПК (~ — домашняя папка user):').pack(anchor='w')
-        cwd = tk.StringVar(value='~')
-        ttk.Entry(frame, textvariable=cwd, width=85).pack(fill='x', pady=4)
-        if self.last_upload_directory:
+        cwd = tk.StringVar(value=preset['cwd'] if preset else '~')
+        ttk.Entry(frame, textvariable=cwd, width=85, state='readonly' if preset else 'normal').pack(fill='x', pady=4)
+        if preset:
+            ttk.Label(frame, text='Папка берётся из отчёта отдельно для каждого ПК. Перед запуском файл проверяется SHA-256.').pack(anchor='w')
+        if self.last_upload_directory and not preset:
             ttk.Button(frame, text='Подставить папку последней передачи',
                        command=lambda: cwd.set(self.last_upload_directory)).pack(anchor='w')
         ttk.Label(frame, text="Пример для переданного скрипта: sh './setup.sh'\n"
                   "Для .deb с sudo: apt-get install -y './package.deb'\n"
                   'Если папки нет, команда не запускается. ~ означает папку user и при sudo.').pack(anchor='w', pady=6)
-        sudo = tk.BooleanVar(value=False)
+        sudo = tk.BooleanVar(value=preset['sudo'] if preset else False)
         ttk.Checkbutton(frame, text='Выполнить от root через sudo', variable=sudo).pack(anchor='w')
         ttk.Label(frame, text='Не вводите пароли в текст команды: команды и вывод сохраняются в отчёте.').pack(anchor='w', pady=8)
         bar = ttk.Frame(frame)
@@ -431,6 +509,8 @@ class Manager:
                 job = dict(script=text.get('1.0', 'end-1c'), sudo=sudo.get(), timeout=int(timeout.get()), cwd=remote_path(cwd.get()))
                 if not job['script'].strip() or len(job['script'].encode()) > 32768 or not 10 <= job['timeout'] <= 1800:
                     raise ValueError('Проверьте команду (до 32 КБ) и время ожидания')
+                if preset:
+                    job['targets'] = preset['targets']
                 dialog.destroy()
                 self.begin('command', job)
             except Exception as error:
@@ -611,6 +691,9 @@ class Manager:
         if not hosts:
             messagebox.showinfo('Выберите компьютеры', 'Поставьте отметки в столбце «Выбор».', parent=self.window)
             return
+        if job and job.get('targets') and any(h.name not in job['targets'] for h in hosts):
+            messagebox.showerror('Выбор ПК изменился', 'Подготовьте запуск файла заново для текущего выбора ПК.', parent=self.window)
+            return
         minutes = int(self.delay.get())
         self.job = job or {}
         self.set_busy(True)
@@ -666,15 +749,19 @@ class Manager:
                 self.trusted[row['name']] = {k: row[k] for k in ('type', 'key', 'fingerprint', 'name')}
             atomic_json(self.trust_file, self.trusted)
         names = ', '.join(row['name'] for row in permitted)
-        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'upload': 'Передать файлы на', 'command': 'Выполнить команду на'}[action]
+        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'upload': 'Передать файлы на', 'download': 'Скачать файл учителя на', 'command': 'Выполнить команду на'}[action]
         text = verb + ' ' + str(len(permitted)) + (' компьютерах?' if action == 'cancel' else ' компьютеров?') + '\n\n' + names
         if action in ('off', 'reboot'):
             text += ('\n\nНЕМЕДЛЕННО, без возможности отмены после выполнения.' if minutes == 0 else '\n\nЧерез ' + str(minutes) + ' мин. после отправки каждому ПК.')
             text += ' Несохранённые данные будут потеряны.'
-        if action == 'upload':
-            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in self.job['files']) + '\nПапка на ученических ПК: ' + self.job['destination'] + '\n~ — домашняя папка user. Существующие файлы не перезаписываются. Автоматического запуска нет.'
+        if action in ('upload', 'download'):
+            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in self.job['files']) + '\nПапка на ученических ПК: ' + self.job['destination'] + '\n~ — домашняя папка user. При совпадении имени будет вопрос о перезаписи. Автоматического запуска нет.'
         if action == 'command':
             text += '\n\n' + ('ПРАВА ROOT (sudo)' if self.job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + self.job['cwd'] + '\n' + self.job['script'][:2000]
+        if action == 'download':
+            text += '\nВыбранные ПК начнут скачивать указанный файл учителя. После скачивания проверяется SHA-256.'
+        if action == 'command' and self.job.get('targets'):
+            text += '\n\nПроверка SHA-256 и запуск файлов:\n' + '\n'.join(row['name'] + ': ' + self.job['targets'][row['name']]['expected_file']['path'] for row in permitted)
         if initial_results:
             text += '\n\nНедоступные или заблокированные ПК пропущены: ' + str(len(initial_results)) + '.'
         if not messagebox.askokcancel('Подтверждение команды учителя', text, icon='warning', default='cancel', parent=self.window):
@@ -690,7 +777,7 @@ class Manager:
             self.set_busy(False)
             messagebox.showerror('Пароль', 'Пароль не должен содержать перевод строки.', parent=self.window)
             return
-        self.summary.set('Передача файлов: подключение…' if action == 'upload' else 'Выполнение: подключение…')
+        self.summary.set('Передача файлов: подключение…' if action in ('upload', 'download') else 'Выполнение: подключение…')
         threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, self.job), daemon=True).start()
         password = None
 
@@ -728,7 +815,11 @@ class Manager:
             for index, pin in enumerate(rows):
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
                 self.events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
-                if action == 'upload':
+                def on_conflict(path):
+                    answer = queue.Queue(maxsize=1)
+                    self.events.put(('overwrite', (pin['name'], path, answer)))
+                    return answer.get()
+                if action in ('upload', 'download'):
                     last_update = 0
                     last_phase = None
                     def progress(value):
@@ -738,15 +829,21 @@ class Manager:
                         if stage != last_phase or now - last_update >= 0.1:
                             self.events.put(('upload_progress', dict(value, label=label)))
                             last_update, last_phase = now, stage
-                    result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'],
-                                            destination=job.get('destination'), progress=progress)
+                    if action == 'upload':
+                        result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'],
+                                                destination=job.get('destination'), progress=progress, on_conflict=on_conflict)
+                    else:
+                        result = download_from_teacher(host_map[pin['name']], pin, password, job['files'][0],
+                                                       destination=job['destination'], progress=progress, on_conflict=on_conflict)
                 elif action == 'command':
-                    self.events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + job.get('cwd', '~')))
-                    result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'], cwd=job.get('cwd', '~'))
+                    target = job.get('targets', {}).get(pin['name'], {})
+                    self.events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + target.get('cwd', job.get('cwd', '~'))))
+                    result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'],
+                                             cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'))
                 else:
                     result = execute(host_map[pin['name']], pin, password, action, minutes)
-                if action == 'upload':
-                    result['requested_destination'] = job.get('destination', '~/CM-Inbox/' + job['batch'])
+                if action in ('upload', 'download'):
+                    result['requested_destination'] = job.get('destination', DEFAULT_INBOX)
                 results.append(result)
                 self.events.put(('result', result))
                 if result.get('stop'):
@@ -770,7 +867,7 @@ class Manager:
                 if kind == 'discovered':
                     self.discovered(*value)
                 elif kind == 'result':
-                    if value.get('action') == 'upload' and value.get('files'):
+                    if value.get('action') in ('upload', 'download') and value.get('files'):
                         self.last_upload_directory = value['requested_destination']
                     self.statuses[value['name']] = (value['message'], not value['ok'])
                     self.refresh()
@@ -784,6 +881,14 @@ class Manager:
                     self.range_found(value)
                 elif kind == 'range_inspected':
                     self.range_results(value)
+                elif kind == 'overwrite':
+                    name, path, answer = value
+                    try:
+                        overwrite = messagebox.askyesno('Перезаписать файл?', name + '\nФайл уже существует:\n' + path + '\n\nЗаменить его выбранным файлом учителя? При ответе «Нет» этот файл будет пропущен.', default='no', icon='warning', parent=self.window)
+                    except Exception:
+                        answer.put(False)
+                        raise
+                    answer.put(overwrite)
                 elif kind == 'operation_status':
                     self.progress.stop()
                     self.progress.configure(mode='indeterminate', maximum=100, value=0)
@@ -798,7 +903,7 @@ class Manager:
                     else:
                         self.progress.configure(mode='determinate', maximum=100, value=percent)
                     self.summary.set(value['label'] + ': ' + value['phase'] + ' ' + value['file']
-                                     + ' • ' + str(round(percent)) + '% (подготовка + передача + проверка)'
+                                     + ' • ' + str(round(percent)) + '% (' + value.get('description', 'подготовка + передача + проверка') + ')'
                                      + '\nПапка на ПК: ' + value['destination'])
                 elif kind == 'scan_progress':
                     self.summary.set(value)
