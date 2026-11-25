@@ -12,7 +12,6 @@ import socket
 import tempfile
 import time
 import threading
-import uuid
 
 
 @dataclass(frozen=True)
@@ -190,7 +189,7 @@ def classify_key(row, trusted, catalog):
     return 'trusted' if previous else 'new'
 
 
-def run(client, command, password=None, timeout=25):
+def run(client, command, password=None, timeout=25, on_progress=None):
     channel = client.get_transport().open_session(timeout=8)
     try:
         channel.exec_command(command)
@@ -198,7 +197,9 @@ def run(client, command, password=None, timeout=25):
         if password is not None:
             channel.sendall((password + '\n').encode('utf-8'))
         channel.shutdown_write()
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
+        last_progress = started - 1
         output = bytearray()
         while time.monotonic() < deadline:
             while channel.recv_ready():
@@ -209,6 +210,10 @@ def run(client, command, password=None, timeout=25):
                 output.extend(channel.recv_stderr(8192))
                 if len(output) > 64 * 1024:
                     raise RuntimeError('Слишком большой ответ; результат требует проверки')
+            now = time.monotonic()
+            if on_progress and now - last_progress >= .5:
+                on_progress(dict(elapsed=int(now - started), output=output.decode('utf-8', errors='replace')))
+                last_progress = now
             if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                 return channel.recv_exit_status(), output.decode('utf-8', errors='replace')
             time.sleep(.04)
@@ -369,7 +374,7 @@ def ensure_remote_directory(sftp, destination, reject_existing=False):
             sftp.mkdir(current, 0o700)
 
 
-def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None):
+def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None, progress=None):
     if not script.strip() or len(script.encode('utf-8')) > 32 * 1024 or '\x00' in script:
         raise ValueError('Введите команду длиной до 32 КБ без NUL')
     if type(timeout) is not int or not 10 <= timeout <= 1800:
@@ -380,9 +385,21 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
         file_launch_spec(expected_file['path'], expected_file['sha256'])
     result = dict(name=host.name, ip=pin['ip'], action='command', ok=False, cwd=cwd or '~')
     client = None
+    def notify(phase, elapsed=0, output=''):
+        if progress:
+            safe = output.replace(password, '[СКРЫТО]')
+            # Withhold a password prefix split across successive SSH reads.
+            for length in range(min(len(password) - 1, len(safe)), 0, -1):
+                if safe.endswith(password[:length]):
+                    safe = safe[:-length] + '[…]'
+                    break
+            result['output'] = safe
+            progress(dict(phase=phase, elapsed=elapsed, output=safe))
+    notify('Подключение и проверка имени/ОС')
     try:
         client = connect_verified(host, pin, password)
         if expected_file is not None:
+            notify('Проверка переданного файла SHA-256')
             check = '/usr/bin/sha256sum -- ' + shell_directory(expected_file['path'])
             code, digest = run(client, check)
             if code != 0 or digest.split()[:1] != [expected_file['sha256']]:
@@ -391,7 +408,11 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
         command = ('LC_ALL=C sudo -k -S -p \'\' ' if sudo else '') + '/bin/bash -c ' + shlex.quote(script)
         if cwd is not None:
             command = '/bin/bash -c ' + shlex.quote('cd -- ' + shell_directory(cwd) + ' && ' + command)
-        code, output = run(client, command, password=password if sudo else None, timeout=timeout)
+        notify('Выполняется')
+        options = dict(password=password if sudo else None, timeout=timeout)
+        if progress:
+            options['on_progress'] = lambda value: notify('Выполняется', value['elapsed'], value['output'])
+        code, output = run(client, command, **options)
         output = output.replace(password, '[СКРЫТО]')
         result.update(ok=code == 0, exit=code, output=output,
                       command=script.replace(password, '[СКРЫТО]'), sudo=sudo,
@@ -419,7 +440,7 @@ def _digest_stream(stream, progress=None):
             progress(len(chunk))
 
 
-def transfer_files(host, pin, password, paths, batch, destination=None, progress=None, on_conflict=None):
+def transfer_files(host, pin, password, paths, batch, destination=None, progress=None, on_conflict=None, access_gate=None, prepared=None):
     import posixpath
     import stat
     if not re.fullmatch(r'[A-Za-z0-9-]{1,80}', batch) or not 1 <= len(paths) <= 20:
@@ -432,7 +453,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
         raise ValueError('Выберите существующие файлы')
     requested = remote_path(destination) if destination is not None else DEFAULT_INBOX
     result = dict(name=host.name, ip=pin['ip'], action='upload', ok=False, files=[], skipped=[], destination=requested)
-    total = sum(p.stat().st_size for p in sources) * 3
+    passes = 2 if prepared is not None else 3
+    total = sum(p.stat().st_size for p in sources) * passes
     done = 0
     def notify(phase, filename='', delta=0):
         nonlocal done
@@ -443,7 +465,7 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
     client = None
     sftp = None
     try:
-        client = connect_verified(host, pin, password)
+        client = access_gate.connect(host, pin, password) if access_gate else connect_verified(host, pin, password)
         sftp = client.open_sftp()
         sftp.get_channel().settimeout(60)
         home = sftp.normalize('.')
@@ -453,7 +475,12 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
         result['destination'] = destination
         ensure_remote_directory(sftp, destination)
         for source in sources:
+            if access_gate:
+                access_gate.check()
             before = source.stat()
+            item = prepared[str(source.resolve())] if prepared is not None else None
+            if item and (before.st_size, before.st_mtime_ns) != (item['size'], item['mtime_ns']):
+                raise RuntimeError('Исходный файл изменился после подготовки: ' + source.name)
             target = posixpath.join(destination, source.name)
             overwrite = False
             try:
@@ -467,12 +494,17 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
                     raise RuntimeError('Файл уже существует; требуется подтверждение перезаписи: ' + target)
                 if not on_conflict(target):
                     result['skipped'].append(target)
-                    notify('Пропущен без перезаписи', source.name, before.st_size * 3)
+                    notify('Пропущен без перезаписи', source.name, before.st_size * passes)
                     continue
                 overwrite = True
-            notify('Подготовка SHA-256', source.name)
-            with source.open('rb') as stream:
-                local_hash = _digest_stream(stream, lambda n: notify('Подготовка SHA-256', source.name, n))
+            if item:
+                local_hash = item['sha256']
+            else:
+                notify('Подготовка SHA-256', source.name)
+                with source.open('rb') as stream:
+                    local_hash = _digest_stream(stream, lambda n: notify('Подготовка SHA-256', source.name, n))
+            if access_gate:
+                access_gate.check()
             temporary = target + '.' + batch + '.part'
             try:
                 sftp.lstat(temporary)
@@ -511,6 +543,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
             result['files'].append(dict(path=target, sha256=local_hash, bytes=before.st_size))
         notify('Готово')
         result.update(ok=True, message='Передано файлов: ' + str(len(result['files'])) + ', пропущено: ' + str(len(result['skipped'])), output='\n'.join(item['path'] for item in result['files']))
+    except TransferStopped as error:
+        result.update(message=str(error), cancelled=True)
     except Exception as error:
         operation_error(result, error, password)
         # Keep already verified files and list them in the report on partial failure.
@@ -600,112 +634,19 @@ def inspect_address(pin, password):
     return result
 
 
-def _serve_file_channel(channel, source, token, size, progress):
-    """Serve one exact file over an SSH-forwarded channel, never a directory."""
-    try:
-        channel.settimeout(60)
-        request = b''
-        while b'\r\n\r\n' not in request:
-            chunk = channel.recv(1024)
-            if not chunk:
-                return
-            request += chunk
-            if len(request) > 8192:
-                return
-        if request.split(b'\r\n', 1)[0] != ('GET /' + token + ' HTTP/1.1').encode('ascii'):
-            channel.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
-            return
-        channel.sendall(('HTTP/1.1 200 OK\r\nContent-Length: ' + str(size) +
-                         '\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n').encode('ascii'))
-        with source.open('rb') as stream:
-            remaining = size
-            while remaining:
-                chunk = stream.read(min(256 * 1024, remaining))
-                if not chunk:
-                    return
-                channel.sendall(chunk)
-                remaining -= len(chunk)
-                progress(len(chunk))
-    except Exception:
-        # The requesting process reports incomplete data or SHA-256 mismatch.
-        pass
-    finally:
-        channel.close()
-
-
-def download_script(url, destination, name, sha256, size, overwrite):
-    """Python stdlib downloader; its content is never executed as a program."""
-    config = dict(url=url, destination=destination, name=name, sha256=sha256,
-                  size=size, overwrite=overwrite)
-    script = '''import os, stat, json, hashlib, urllib.request, pathlib, uuid
-cfg = json.loads(CONFIG)
-directory = pathlib.Path(cfg['destination']).expanduser()
-current = pathlib.Path('/')
-for part in directory.parts[1:]:
-    current = current / part
-    try:
-        info = current.lstat()
-    except FileNotFoundError:
-        current.mkdir(mode=0o700)
-    else:
-        if not stat.S_ISDIR(info.st_mode):
-            raise RuntimeError('Путь не является обычной папкой: ' + str(current))
-target = directory / cfg['name']
-try:
-    previous = target.lstat()
-except FileNotFoundError:
-    previous = None
-if previous is not None:
-    if not stat.S_ISREG(previous.st_mode) or not cfg['overwrite']:
-        raise RuntimeError('Перезапись не разрешена: ' + str(target))
-temporary = directory / ('.cm-' + uuid.uuid4().hex + '.part')
-try:
-    digest = hashlib.sha256()
-    size = 0
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with temporary.open('xb') as output:
-        os.chmod(temporary, 0o600)
-        with opener.open(cfg['url'], timeout=60) as response:
-            while True:
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > cfg['size']:
-                    raise RuntimeError('Размер файла изменился')
-                digest.update(chunk)
-                output.write(chunk)
-    if size != cfg['size'] or digest.hexdigest() != cfg['sha256']:
-        raise RuntimeError('Размер или SHA-256 не совпали')
-    if previous is None:
-        os.link(temporary, target)  # Atomic refusal to overwrite an existing file.
-        temporary.unlink()
-    else:
-        current = target.lstat()
-        if (current.st_ino, current.st_mtime_ns, current.st_size, current.st_mode) != (previous.st_ino, previous.st_mtime_ns, previous.st_size, previous.st_mode):
-            raise RuntimeError('Файл изменился после подтверждения')
-        os.replace(temporary, target)
-    print(json.dumps(dict(path=str(target), sha256=digest.hexdigest(), bytes=size)))
-finally:
-    if temporary.exists():
-        temporary.unlink()
-'''
-    return script.replace('CONFIG', repr(json.dumps(config, ensure_ascii=False)), 1)
-
-
-class DownloadStopped(RuntimeError):
+class TransferStopped(RuntimeError):
     pass
 
 
-class DownloadAccessGate:
-    """Serialize password attempts only; file downloads run concurrently."""
+class TransferAccessGate:
+    """Serialize password attempts only; file transfers run concurrently."""
     def __init__(self):
         self.lock = threading.Lock()
         self.stopped = threading.Event()
 
     def check(self):
         if self.stopped.is_set():
-            raise DownloadStopped('Пропущен после ошибки доступа; повторных попыток нет')
+            raise TransferStopped('Пропущен после ошибки доступа; повторных попыток нет')
 
     def connect(self, host, pin, password):
         import paramiko
@@ -718,7 +659,7 @@ class DownloadAccessGate:
                 raise
 
 
-def prepare_download(path, progress=None):
+def prepare_transfer(path, progress=None):
     source = Path(path)
     if not source.is_file():
         raise ValueError('Выберите существующий файл')
@@ -729,102 +670,3 @@ def prepare_download(path, progress=None):
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise RuntimeError('Исходный файл изменился во время подготовки; отправка не начата')
     return dict(path=str(source.resolve()), size=before.st_size, mtime_ns=before.st_mtime_ns, sha256=digest)
-
-
-def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, progress=None, on_conflict=None, access_gate=None, prepared=None):
-    import posixpath
-    import stat
-    source = Path(path)
-    destination = remote_path(destination)
-    if not source.is_file() or any(c in source.name for c in '\x00\r\n/\\'):
-        raise ValueError('Выберите существующий файл с допустимым именем')
-    result = dict(name=host.name, ip=pin['ip'], action='download', ok=False, files=[], skipped=[], destination=destination)
-    client = sftp = transport = None
-    port = None
-    done = 0
-    before = source.stat()
-    total = before.st_size if prepared else before.st_size * 2
-    def notify(phase, delta=0):
-        nonlocal done
-        done += delta
-        if progress:
-            progress(dict(phase=phase, file=source.name, done=done, total=total,
-                          destination=result['destination'], description=('скачивание; SHA-256 на ПК' if prepared else 'подготовка + скачивание; SHA-256 на ПК')))
-    notify('Подключение и проверка имени/ОС')
-    try:
-        if prepared and (str(source.resolve()), before.st_size, before.st_mtime_ns) != (prepared['path'], prepared['size'], prepared['mtime_ns']):
-            raise RuntimeError('Исходный файл изменился после подготовки; скачивание не начато')
-        client = access_gate.connect(host, pin, password) if access_gate else connect_verified(host, pin, password)
-        sftp = client.open_sftp()
-        sftp.get_channel().settimeout(60)
-        home = sftp.normalize('.')
-        if not home.startswith('/') or home == '/':
-            raise RuntimeError('Не подтверждён домашний каталог user')
-        folder = home if destination == '~' else (posixpath.join(home, destination[2:]) if destination.startswith('~/') else destination)
-        result['destination'] = folder
-        # Only inspect here: downloader creates the directory after confirmation.
-        target = posixpath.join(folder, source.name)
-        overwrite = False
-        try:
-            existing = sftp.lstat(target)
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISREG(existing.st_mode):
-                raise RuntimeError('Нельзя заменить каталог или ссылку: ' + target)
-            if on_conflict is None:
-                raise RuntimeError('Файл уже существует; требуется подтверждение перезаписи: ' + target)
-            if not on_conflict(target):
-                result.update(ok=True, message='Файл пропущен без перезаписи', skipped=[target])
-                return result
-            overwrite = True
-        if prepared:
-            digest = prepared['sha256']
-        else:
-            notify('Подготовка SHA-256')
-            with source.open('rb') as stream:
-                digest = _digest_stream(stream, lambda n: notify('Подготовка SHA-256', n))
-        if access_gate:
-            access_gate.check()
-        token = uuid.uuid4().hex
-        transport = client.get_transport()
-        def handler(channel, origin, server):
-            threading.Thread(target=_serve_file_channel,
-                             args=(channel, source, token, before.st_size, lambda n: notify('Скачивание с учительского ПК', n)),
-                             daemon=True).start()
-        try:
-            port = transport.request_port_forward('127.0.0.1', 0, handler=handler)
-        except Exception as error:
-            raise RuntimeError('SSH-сервер не разрешил канал скачивания. Используйте «Передать файлы». Причина: ' + str(error))
-        script = download_script('http://127.0.0.1:' + str(port) + '/' + token,
-                                 folder, source.name, digest, before.st_size, overwrite)
-        notify('Ожидание скачивания и проверки SHA-256')
-        if access_gate:
-            access_gate.check()
-        code, output = run(client, '/usr/bin/python3 -c ' + shlex.quote(script), timeout=1800)
-        if code != 0:
-            raise RuntimeError('Скачивание не подтверждено; проверьте ПК перед повтором. ' + output)
-        item = json.loads(output)
-        if item.get('sha256') != digest or item.get('path') != target or item.get('bytes') != before.st_size:
-            raise RuntimeError('Не подтверждён результат скачивания')
-        result['files'].append(item)
-        after = source.stat()
-        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-            raise RuntimeError('Исходный файл изменился во время скачивания; проверьте результат')
-        notify('Готово')
-        result.update(ok=True, message='Файл скачан и проверен SHA-256', output=target)
-    except DownloadStopped as error:
-        result.update(message=str(error), cancelled=True)
-    except Exception as error:
-        operation_error(result, error, password)
-    finally:
-        if port is not None and transport:
-            try:
-                transport.cancel_port_forward('127.0.0.1', port)
-            except Exception:
-                pass
-        if sftp:
-            sftp.close()
-        if client:
-            client.close()
-    return result

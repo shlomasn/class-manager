@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import posixpath
 import threading
 import time
@@ -12,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, download_from_teacher, prepare_download, DownloadAccessGate
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -48,7 +49,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.5 — управление школьными компьютерами')
+        window.title('CM Astra 1.6 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -113,8 +114,7 @@ class Manager:
         self.button(actions, 'Отменить выключение', lambda: self.begin('cancel'))
         remote = ttk.Frame(outer)
         remote.pack(fill='x', pady=(10, 0))
-        self.button(remote, 'Передать файлы…', self.upload_dialog)
-        self.button(remote, 'Скачать файл учителя…', self.download_dialog)
+        self.button(remote, 'Раздать файлы', self.distribute_dialog)
         remote = ttk.Frame(outer)
         remote.pack(fill='x', pady=(7, 0))
         self.button(remote, 'Запустить переданный файл…', self.launch_dialog)
@@ -380,15 +380,8 @@ class Manager:
         dialog.grab_set()
         self.window.wait_window(dialog)
 
-    def download_dialog(self):
-        self.upload_dialog(download=True)
-
-    def upload_dialog(self, download=False):
-        if download:
-            path = filedialog.askopenfilename(parent=self.window, title='Какой файл выбранные ПК должны скачать с компьютера учителя?')
-            files = [path] if path else []
-        else:
-            files = filedialog.askopenfilenames(parent=self.window, title='Программы и файлы для передачи (до 20 файлов)')
+    def distribute_dialog(self):
+        files = filedialog.askopenfilenames(parent=self.window, title='Файлы для одновременной раздачи выбранным ПК (до 20)')
         if not files:
             return
         if len(files) > 20:
@@ -409,7 +402,7 @@ class Manager:
         except ValueError as error:
             messagebox.showerror('Папка назначения', str(error), parent=self.window)
             return
-        self.begin('download' if download else 'upload', dict(files=list(files), batch=batch, destination=destination))
+        self.begin('distribute', dict(files=list(files), batch=batch, destination=destination))
 
     def transferred_files(self):
         records = []
@@ -749,17 +742,17 @@ class Manager:
                 self.trusted[row['name']] = {k: row[k] for k in ('type', 'key', 'fingerprint', 'name')}
             atomic_json(self.trust_file, self.trusted)
         names = ', '.join(row['name'] for row in permitted)
-        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'upload': 'Передать файлы на', 'download': 'Скачать файл учителя на', 'command': 'Выполнить команду на'}[action]
+        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на'}[action]
         text = verb + ' ' + str(len(permitted)) + (' компьютерах?' if action == 'cancel' else ' компьютеров?') + '\n\n' + names
         if action in ('off', 'reboot'):
             text += ('\n\nНЕМЕДЛЕННО, без возможности отмены после выполнения.' if minutes == 0 else '\n\nЧерез ' + str(minutes) + ' мин. после отправки каждому ПК.')
             text += ' Несохранённые данные будут потеряны.'
-        if action in ('upload', 'download'):
+        if action == 'distribute':
             text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in self.job['files']) + '\nПапка на ученических ПК: ' + self.job['destination'] + '\n~ — домашняя папка user. При совпадении имени будет вопрос о перезаписи. Автоматического запуска нет.'
         if action == 'command':
             text += '\n\n' + ('ПРАВА ROOT (sudo)' if self.job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + self.job['cwd'] + '\n' + self.job['script'][:2000]
-        if action == 'download':
-            text += '\nВыбранные ПК будут скачивать файл одновременно, не ожидая завершения друг друга. После скачивания проверяется SHA-256.'
+        if action == 'distribute':
+            text += '\nФайлы раздаются всем выбранным ПК параллельно. После передачи проверяется SHA-256.'
         if action == 'command' and self.job.get('targets'):
             text += '\n\nПроверка SHA-256 и запуск файлов:\n' + '\n'.join(row['name'] + ': ' + self.job['targets'][row['name']]['expected_file']['path'] for row in permitted)
         if initial_results:
@@ -777,7 +770,7 @@ class Manager:
             self.set_busy(False)
             messagebox.showerror('Пароль', 'Пароль не должен содержать перевод строки.', parent=self.window)
             return
-        self.summary.set('Передача файлов: подключение…' if action in ('upload', 'download') else 'Выполнение: подключение…')
+        self.summary.set('Передача файлов: подключение…' if action == 'distribute' else 'Выполнение: подключение…')
         threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, self.job), daemon=True).start()
         password = None
 
@@ -809,9 +802,9 @@ class Manager:
         self.window.wait_window(dialog)
         return result[0]
 
-    def send_downloads(self, host_map, rows, password, job):
-        # Hash a large teacher file once, before launching independent downloads.
-        total = Path(job['files'][0]).stat().st_size
+    def distribute_files(self, host_map, rows, password, job):
+        # Prepare each source once; every selected PC gets an independent SFTP session.
+        total = sum(Path(path).stat().st_size for path in job['files'])
         done = 0
         last_prepare = 0
         def preparation(count):
@@ -819,12 +812,13 @@ class Manager:
             done += count
             now = time.monotonic()
             if now - last_prepare >= .2:
-                self.events.put(('scan_progress', 'Подготовка файла для всех ПК: SHA-256 ' + str(round(done * 100 / total) if total else 100) + '%'))
+                self.events.put(('scan_progress', 'Подготовка файлов для всех ПК: SHA-256 ' + str(round(done * 100 / total) if total else 100) + '%'))
                 last_prepare = now
-        self.events.put(('scan_progress', 'Подготовка файла для одновременного скачивания…'))
-        prepared = prepare_download(job['files'][0], progress=preparation)
-        gate = DownloadAccessGate()
-        self.events.put(('download_started', [pin['name'] for pin in rows]))
+        self.events.put(('scan_progress', 'Подготовка файлов для одновременной раздачи…'))
+        prepared = {str(Path(path).resolve()): prepare_transfer(path, progress=preparation) for path in job['files']}
+        batch = job.get('batch') or uuid.uuid4().hex
+        gate = TransferAccessGate()
+        self.events.put(('distribution_started', [pin['name'] for pin in rows]))
         def worker(pin):
             name = pin['name']
             last_update = 0
@@ -832,19 +826,20 @@ class Manager:
             def progress(value):
                 nonlocal last_update, last_phase
                 now = time.monotonic()
-                if value['phase'] != last_phase or now - last_update >= .2:
-                    self.events.put(('download_progress', dict(value, name=name)))
-                    last_update, last_phase = now, value['phase']
+                stage = (value['phase'], value.get('file', ''))
+                if stage != last_phase or now - last_update >= .2:
+                    self.events.put(('distribution_progress', dict(value, name=name)))
+                    last_update, last_phase = now, stage
             def on_conflict(path):
                 answer = queue.Queue(maxsize=1)
                 self.events.put(('overwrite', (name, path, answer)))
                 return answer.get()
             try:
-                result = download_from_teacher(host_map[name], pin, password, job['files'][0],
-                                               destination=job['destination'], progress=progress,
-                                               on_conflict=on_conflict, access_gate=gate, prepared=prepared)
+                result = transfer_files(host_map[name], pin, password, job['files'], batch,
+                                        destination=job['destination'], progress=progress,
+                                        on_conflict=on_conflict, access_gate=gate, prepared=prepared)
             except Exception as error:
-                result = dict(name=name, ip=pin['ip'], action='download', ok=False,
+                result = dict(name=name, ip=pin['ip'], action='upload', ok=False,
                               message=str(error).replace(password, '[СКРЫТО]'))
             result['requested_destination'] = job['destination']
             self.events.put(('result', result))
@@ -857,48 +852,33 @@ class Manager:
             results = {pending[future]: future.result() for future in as_completed(pending)}
         return [results[pin['name']] for pin in rows]
 
-    def update_download_summary(self):
-        state = self.download_state
+    def update_distribution_summary(self):
+        state = self.distribution_state
         complete = sum(item['complete'] for item in state.values())
         percent = sum(item['percent'] for item in state.values()) / len(state) if state else 100
         self.progress.stop()
         self.progress.configure(mode='determinate', maximum=100, value=percent)
-        self.summary.set('Параллельное скачивание: завершено ПК ' + str(complete) + '/' + str(len(state))
+        self.summary.set('Раздача файлов: завершено ПК ' + str(complete) + '/' + str(len(state))
                          + '. Прогресс каждого ПК — в столбце «Состояние / результат».')
 
     def send(self, host_map, rows, password, action, minutes, initial_results, job=None):
         results = list(initial_results)
         try:
-            if action == 'download':
-                results.extend(self.send_downloads(host_map, rows, password, job))
-            for index, pin in enumerate([] if action == 'download' else rows):
+            if action == 'distribute':
+                results.extend(self.distribute_files(host_map, rows, password, job))
+            if action == 'command':
+                self.events.put(('command_waiting', [pin['name'] for pin in rows]))
+            for index, pin in enumerate([] if action == 'distribute' else rows):
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
                 self.events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
-                def on_conflict(path):
-                    answer = queue.Queue(maxsize=1)
-                    self.events.put(('overwrite', (pin['name'], path, answer)))
-                    return answer.get()
-                if action == 'upload':
-                    last_update = 0
-                    last_phase = None
-                    def progress(value):
-                        nonlocal last_update, last_phase
-                        now = time.monotonic()
-                        stage = (value['phase'], value['file'])
-                        if stage != last_phase or now - last_update >= 0.1:
-                            self.events.put(('upload_progress', dict(value, label=label)))
-                            last_update, last_phase = now, stage
-                    result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'],
-                                            destination=job.get('destination'), progress=progress, on_conflict=on_conflict)
-                elif action == 'command':
+                if action == 'command':
                     target = job.get('targets', {}).get(pin['name'], {})
                     self.events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + target.get('cwd', job.get('cwd', '~'))))
                     result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'],
-                                             cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'))
+                                             cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'),
+                                             progress=lambda value, name=pin['name']: self.events.put(('command_progress', dict(value, name=name))))
                 else:
                     result = execute(host_map[pin['name']], pin, password, action, minutes)
-                if action in ('upload', 'download'):
-                    result['requested_destination'] = job.get('destination', DEFAULT_INBOX)
                 results.append(result)
                 self.events.put(('result', result))
                 if result.get('stop'):
@@ -922,9 +902,9 @@ class Manager:
                 if kind == 'discovered':
                     self.discovered(*value)
                 elif kind == 'result':
-                    if value.get('action') == 'download' and value['name'] in getattr(self, 'download_state', {}):
-                        self.download_state[value['name']] = dict(percent=100, complete=True)
-                        self.update_download_summary()
+                    if value.get('action') in ('upload', 'download') and value['name'] in getattr(self, 'distribution_state', {}):
+                        self.distribution_state[value['name']] = dict(percent=100, complete=True)
+                        self.update_distribution_summary()
                     if value.get('action') in ('upload', 'download') and value.get('files'):
                         self.last_upload_directory = value['requested_destination']
                     self.statuses[value['name']] = (value['message'], not value['ok'])
@@ -935,23 +915,41 @@ class Manager:
                     good = sum(r['ok'] for r in results)
                     self.set_busy(False)
                     self.summary.set('Готово: успешно ' + str(good) + ', ошибок/пропусков ' + str(len(results) - good) + '. Отчёт: ' + report)
-                elif kind == 'download_started':
-                    self.download_state = {name: dict(percent=0, complete=False) for name in value}
+                elif kind == 'command_waiting':
                     for name in value:
-                        self.statuses[name] = ('Ожидает подключения для скачивания', False)
+                        self.statuses[name] = ('Ожидает выполнения команды', False)
                     self.refresh()
-                    self.update_download_summary()
-                elif kind == 'download_progress':
+                elif kind == 'command_progress':
                     name = value['name']
-                    state = self.download_state.get(name)
+                    output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value['output'])
+                    lines = output.replace('\r', '\n').splitlines()
+                    latest = next((line.strip() for line in reversed(lines) if line.strip()), '')
+                    label = value['phase'] + ' • ' + str(value['elapsed']) + ' с'
+                    if latest:
+                        label += ' • ' + latest[:180]
+                    else:
+                        label += ' • ожидание вывода'
+                    self.statuses[name] = (label, False)
+                    if self.table.exists(name):
+                        self.table.set(name, 'status', label)
+                    self.summary.set(name + ': ' + label)
+                elif kind == 'distribution_started':
+                    self.distribution_state = {name: dict(percent=0, complete=False) for name in value}
+                    for name in value:
+                        self.statuses[name] = ('Ожидает подключения для раздачи', False)
+                    self.refresh()
+                    self.update_distribution_summary()
+                elif kind == 'distribution_progress':
+                    name = value['name']
+                    state = self.distribution_state.get(name)
                     if state is not None and not state['complete']:
                         percent = min(99, value['done'] * 100 / value['total']) if value['total'] else 0
                         state['percent'] = percent
-                        label = value['phase'] + ' • ' + str(int(percent)) + '%'
+                        label = value['phase'] + ' ' + value.get('file', '') + ' • ' + str(int(percent)) + '%'
                         self.statuses[name] = (label, False)
                         if self.table.exists(name):
                             self.table.set(name, 'status', label)
-                        self.update_download_summary()
+                        self.update_distribution_summary()
                 elif kind == 'range_found':
                     self.range_found(value)
                 elif kind == 'range_inspected':
@@ -969,17 +967,6 @@ class Manager:
                     self.progress.configure(mode='indeterminate', maximum=100, value=0)
                     self.progress.start(12)
                     self.summary.set(value)
-                elif kind == 'upload_progress':
-                    self.progress.stop()
-                    percent = min(100, value['done'] * 100 / value['total']) if value['total'] else (100 if value['phase'] == 'Готово' else 0)
-                    if value['phase'] == 'Подключение и проверка имени/ОС':
-                        self.progress.configure(mode='indeterminate', maximum=100, value=0)
-                        self.progress.start(12)
-                    else:
-                        self.progress.configure(mode='determinate', maximum=100, value=percent)
-                    self.summary.set(value['label'] + ': ' + value['phase'] + ' ' + value['file']
-                                     + ' • ' + str(round(percent)) + '% (' + value.get('description', 'подготовка + передача + проверка') + ')'
-                                     + '\nПапка на ПК: ' + value['destination'])
                 elif kind == 'scan_progress':
                     self.summary.set(value)
                 elif kind == 'error':
