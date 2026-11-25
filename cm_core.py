@@ -309,16 +309,41 @@ def operation_error(result, error, password):
     return result
 
 
-def execute_command(host, pin, password, script, sudo=False, timeout=300):
+def remote_path(value):
+    """Validate a Linux path without expanding shell syntax or other users' homes."""
+    import posixpath
+    if not isinstance(value, str) or not value or any(c in value for c in '\x00\r\n'):
+        raise ValueError('Укажите папку на ученическом ПК: /полный/путь или ~/папка')
+    if not (value.startswith('/') or value == '~' or value.startswith('~/')):
+        raise ValueError('Путь должен начинаться с / или ~/ (домашняя папка user)')
+    if '..' in value.split('/'):
+        raise ValueError('Укажите путь без ..')
+    return posixpath.normpath(value)
+
+
+def shell_directory(value):
+    value = remote_path(value)
+    if value == '~':
+        return '"$HOME"'
+    if value.startswith('~/'):
+        return '"$HOME"/' + shlex.quote(value[2:])
+    return shlex.quote(value)
+
+
+def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None):
     if not script.strip() or len(script.encode('utf-8')) > 32 * 1024 or '\x00' in script:
         raise ValueError('Введите команду длиной до 32 КБ без NUL')
     if type(timeout) is not int or not 10 <= timeout <= 1800:
         raise ValueError('Ожидание команды: от 10 до 1800 секунд')
-    result = dict(name=host.name, ip=pin['ip'], action='command', ok=False)
+    if cwd is not None:
+        cwd = remote_path(cwd)
+    result = dict(name=host.name, ip=pin['ip'], action='command', ok=False, cwd=cwd or '~')
     client = None
     try:
         client = connect_verified(host, pin, password)
         command = ('LC_ALL=C sudo -k -S -p \'\' ' if sudo else '') + '/bin/bash -c ' + shlex.quote(script)
+        if cwd is not None:
+            command = '/bin/bash -c ' + shlex.quote('cd -- ' + shell_directory(cwd) + ' && ' + command)
         code, output = run(client, command, password=password if sudo else None, timeout=timeout)
         output = output.replace(password, '[СКРЫТО]')
         result.update(ok=code == 0, exit=code, output=output,
@@ -336,16 +361,18 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300):
     return result
 
 
-def _digest_stream(stream):
+def _digest_stream(stream, progress=None):
     digest = hashlib.sha256()
     while True:
         chunk = stream.read(1024 * 1024)
         if not chunk:
             return digest.hexdigest()
         digest.update(chunk)
+        if progress:
+            progress(len(chunk))
 
 
-def transfer_files(host, pin, password, paths, batch):
+def transfer_files(host, pin, password, paths, batch, destination=None, progress=None):
     import posixpath
     import stat
     if not re.fullmatch(r'[A-Za-z0-9-]{1,80}', batch) or not 1 <= len(paths) <= 20:
@@ -356,7 +383,16 @@ def transfer_files(host, pin, password, paths, batch):
         raise ValueError('Повторные или недопустимые имена файлов')
     if any(not p.is_file() for p in sources):
         raise ValueError('Выберите существующие файлы')
-    result = dict(name=host.name, ip=pin['ip'], action='upload', ok=False, files=[])
+    requested = remote_path(destination) if destination is not None else '~/CM-Inbox/' + batch
+    result = dict(name=host.name, ip=pin['ip'], action='upload', ok=False, files=[], destination=requested)
+    total = sum(p.stat().st_size for p in sources) * 3
+    done = 0
+    def notify(phase, filename='', delta=0):
+        nonlocal done
+        done += delta
+        if progress:
+            progress(dict(phase=phase, file=filename, done=done, total=total, destination=result['destination']))
+    notify('Подключение и проверка имени/ОС')
     client = None
     sftp = None
     try:
@@ -366,26 +402,53 @@ def transfer_files(host, pin, password, paths, batch):
         home = sftp.normalize('.')
         if not home.startswith('/') or home == '/':
             raise RuntimeError('Не подтверждён домашний каталог user')
-        parent = posixpath.join(home, 'CM-Inbox')
-        try:
-            info = sftp.lstat(parent)
-            if not stat.S_ISDIR(info.st_mode):
-                raise RuntimeError('CM-Inbox не является обычным каталогом')
-        except FileNotFoundError:
-            sftp.mkdir(parent, 0o700)
-        destination = posixpath.join(parent, batch)
-        sftp.mkdir(destination, 0o700)  # Never overwrite an existing batch.
+        destination = home if requested == '~' else (posixpath.join(home, requested[2:]) if requested.startswith('~/') else requested)
+        result['destination'] = destination
+        # Reject symlinks and create missing directories with user-only permissions.
+        current = '/'
+        for part in destination.strip('/').split('/'):
+            if not part:
+                continue
+            current = posixpath.join(current, part)
+            try:
+                info = sftp.lstat(current)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise RuntimeError('Путь не является обычным каталогом: ' + current)
+                if destination == current and requested == '~/CM-Inbox/' + batch:
+                    raise RuntimeError('Каталог отправки уже существует; выберите новую папку')
+            except FileNotFoundError:
+                sftp.mkdir(current, 0o700)
         for source in sources:
             before = source.stat()
-            with source.open('rb') as stream:
-                local_hash = _digest_stream(stream)
             target = posixpath.join(destination, source.name)
-            temporary = target + '.part'
             try:
-                sftp.put(str(source), temporary, confirm=True)
+                sftp.lstat(target)
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError('Файл уже существует; перезапись запрещена: ' + target)
+            notify('Подготовка SHA-256', source.name)
+            with source.open('rb') as stream:
+                local_hash = _digest_stream(stream, lambda n: notify('Подготовка SHA-256', source.name, n))
+            temporary = target + '.' + batch + '.part'
+            try:
+                sftp.lstat(temporary)
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError('Временный файл уже существует; выберите новую отправку: ' + temporary)
+            try:
+                notify('Передача', source.name)
+                previous = 0
+                def transferred(count, size):
+                    nonlocal previous
+                    notify('Передача', source.name, count - previous)
+                    previous = count
+                sftp.put(str(source), temporary, callback=transferred, confirm=True)
                 sftp.chmod(temporary, 0o600)
+                notify('Проверка SHA-256 на ПК', source.name)
                 with sftp.open(temporary, 'rb') as stream:
-                    remote_hash = _digest_stream(stream)
+                    remote_hash = _digest_stream(stream, lambda n: notify('Проверка SHA-256 на ПК', source.name, n))
                 after = source.stat()
                 if local_hash != remote_hash or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                     raise RuntimeError('Файл изменился или контрольная сумма не совпала: ' + source.name)
@@ -397,6 +460,7 @@ def transfer_files(host, pin, password, paths, batch):
                     pass
                 raise
             result['files'].append(dict(path=target, sha256=local_hash, bytes=before.st_size))
+        notify('Готово')
         result.update(ok=True, message='Передано файлов: ' + str(len(sources)), output='\n'.join(item['path'] for item in result['files']))
     except Exception as error:
         operation_error(result, error, password)

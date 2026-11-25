@@ -6,11 +6,12 @@ import os
 from pathlib import Path
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ class Manager:
         self.catalog = json.loads((ROOT / 'key-catalog.json').read_text(encoding='utf-8'))
         self.trusted = json.loads(self.trust_file.read_text(encoding='utf-8')) if self.trust_file.exists() else {}
         self.trusted = {value.get('name', key): value for key, value in self.trusted.items()}
+        self.last_upload_directory = None
         self.job = {}
         self.last_results = []
         self.last_ips = {}
@@ -45,7 +47,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra — управление школьными компьютерами')
+        window.title('CM Astra 1.3 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -380,7 +382,22 @@ class Manager:
         if len(files) > 20:
             messagebox.showerror('Передача файлов', 'За одну отправку допускается до 20 файлов.', parent=self.window)
             return
-        self.begin('upload', dict(files=list(files), batch=datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]))
+        batch = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+        destination = simpledialog.askstring(
+            'Куда передать файлы на ученических ПК?',
+            'Папка НА УЧЕНИЧЕСКИХ ПК (одинаковый путь для всех выбранных):\n'
+            '~/ — домашняя папка user; можно указать /полный/путь.\n'
+            'Недостающие папки будут созданы. Существующие файлы не перезаписываются.\n'
+            'Передача не запускает файлы. Права записи — у user.',
+            initialvalue='~/CM-Inbox/' + batch, parent=self.window)
+        if destination is None:
+            return
+        try:
+            destination = remote_path(destination)
+        except ValueError as error:
+            messagebox.showerror('Папка назначения', str(error), parent=self.window)
+            return
+        self.begin('upload', dict(files=list(files), batch=batch, destination=destination))
 
     def command_dialog(self):
         dialog = tk.Toplevel(self.window)
@@ -392,6 +409,15 @@ class Manager:
         text = tk.Text(frame, width=85, height=10, wrap='word')
         text.insert('1.0', 'hostname; uptime')
         text.pack(fill='both', expand=True, pady=10)
+        ttk.Label(frame, text='Рабочая папка НА УЧЕНИЧЕСКИХ ПК (~ — домашняя папка user):').pack(anchor='w')
+        cwd = tk.StringVar(value='~')
+        ttk.Entry(frame, textvariable=cwd, width=85).pack(fill='x', pady=4)
+        if self.last_upload_directory:
+            ttk.Button(frame, text='Подставить папку последней передачи',
+                       command=lambda: cwd.set(self.last_upload_directory)).pack(anchor='w')
+        ttk.Label(frame, text="Пример для переданного скрипта: sh './setup.sh'\n"
+                  "Для .deb с sudo: apt-get install -y './package.deb'\n"
+                  'Если папки нет, команда не запускается. ~ означает папку user и при sudo.').pack(anchor='w', pady=6)
         sudo = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text='Выполнить от root через sudo', variable=sudo).pack(anchor='w')
         ttk.Label(frame, text='Не вводите пароли в текст команды: команды и вывод сохраняются в отчёте.').pack(anchor='w', pady=8)
@@ -402,7 +428,7 @@ class Manager:
         ttk.Entry(bar, textvariable=timeout, width=6).pack(side='left', padx=6)
         def submit():
             try:
-                job = dict(script=text.get('1.0', 'end-1c'), sudo=sudo.get(), timeout=int(timeout.get()))
+                job = dict(script=text.get('1.0', 'end-1c'), sudo=sudo.get(), timeout=int(timeout.get()), cwd=remote_path(cwd.get()))
                 if not job['script'].strip() or len(job['script'].encode()) > 32768 or not 10 <= job['timeout'] <= 1800:
                     raise ValueError('Проверьте команду (до 32 КБ) и время ожидания')
                 dialog.destroy()
@@ -575,6 +601,7 @@ class Manager:
         self.room_box.configure(state='disabled' if value else 'readonly')
         self.delay_box.configure(state='disabled' if value else 'readonly')
         if value:
+            self.progress.configure(mode='indeterminate', value=0, maximum=100)
             self.progress.start(12)
         else:
             self.progress.stop()
@@ -645,9 +672,9 @@ class Manager:
             text += ('\n\nНЕМЕДЛЕННО, без возможности отмены после выполнения.' if minutes == 0 else '\n\nЧерез ' + str(minutes) + ' мин. после отправки каждому ПК.')
             text += ' Несохранённые данные будут потеряны.'
         if action == 'upload':
-            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in self.job['files']) + '\nКаталог CM-Inbox/' + self.job['batch'] + '. Автоматического запуска нет.'
+            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in self.job['files']) + '\nПапка на ученических ПК: ' + self.job['destination'] + '\n~ — домашняя папка user. Существующие файлы не перезаписываются. Автоматического запуска нет.'
         if action == 'command':
-            text += '\n\n' + ('ПРАВА ROOT (sudo)' if self.job['sudo'] else 'Права локального user') + '\n' + self.job['script'][:2000]
+            text += '\n\n' + ('ПРАВА ROOT (sudo)' if self.job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + self.job['cwd'] + '\n' + self.job['script'][:2000]
         if initial_results:
             text += '\n\nНедоступные или заблокированные ПК пропущены: ' + str(len(initial_results)) + '.'
         if not messagebox.askokcancel('Подтверждение команды учителя', text, icon='warning', default='cancel', parent=self.window):
@@ -663,7 +690,7 @@ class Manager:
             self.set_busy(False)
             messagebox.showerror('Пароль', 'Пароль не должен содержать перевод строки.', parent=self.window)
             return
-        self.summary.set('Отправка команд…')
+        self.summary.set('Передача файлов: подключение…' if action == 'upload' else 'Выполнение: подключение…')
         threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, self.job), daemon=True).start()
         password = None
 
@@ -699,12 +726,27 @@ class Manager:
         results = list(initial_results)
         try:
             for index, pin in enumerate(rows):
+                label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
+                self.events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
                 if action == 'upload':
-                    result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'])
+                    last_update = 0
+                    last_phase = None
+                    def progress(value):
+                        nonlocal last_update, last_phase
+                        now = time.monotonic()
+                        stage = (value['phase'], value['file'])
+                        if stage != last_phase or now - last_update >= 0.1:
+                            self.events.put(('upload_progress', dict(value, label=label)))
+                            last_update, last_phase = now, stage
+                    result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'],
+                                            destination=job.get('destination'), progress=progress)
                 elif action == 'command':
-                    result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'])
+                    self.events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + job.get('cwd', '~')))
+                    result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'], cwd=job.get('cwd', '~'))
                 else:
                     result = execute(host_map[pin['name']], pin, password, action, minutes)
+                if action == 'upload':
+                    result['requested_destination'] = job.get('destination', '~/CM-Inbox/' + job['batch'])
                 results.append(result)
                 self.events.put(('result', result))
                 if result.get('stop'):
@@ -728,6 +770,8 @@ class Manager:
                 if kind == 'discovered':
                     self.discovered(*value)
                 elif kind == 'result':
+                    if value.get('action') == 'upload' and value.get('files'):
+                        self.last_upload_directory = value['requested_destination']
                     self.statuses[value['name']] = (value['message'], not value['ok'])
                     self.refresh()
                 elif kind == 'finished':
@@ -740,6 +784,22 @@ class Manager:
                     self.range_found(value)
                 elif kind == 'range_inspected':
                     self.range_results(value)
+                elif kind == 'operation_status':
+                    self.progress.stop()
+                    self.progress.configure(mode='indeterminate', maximum=100, value=0)
+                    self.progress.start(12)
+                    self.summary.set(value)
+                elif kind == 'upload_progress':
+                    self.progress.stop()
+                    percent = min(100, value['done'] * 100 / value['total']) if value['total'] else (100 if value['phase'] == 'Готово' else 0)
+                    if value['phase'] == 'Подключение и проверка имени/ОС':
+                        self.progress.configure(mode='indeterminate', maximum=100, value=0)
+                        self.progress.start(12)
+                    else:
+                        self.progress.configure(mode='determinate', maximum=100, value=percent)
+                    self.summary.set(value['label'] + ': ' + value['phase'] + ' ' + value['file']
+                                     + ' • ' + str(round(percent)) + '% (подготовка + передача + проверка)'
+                                     + '\nПапка на ПК: ' + value['destination'])
                 elif kind == 'scan_progress':
                     self.summary.set(value)
                 elif kind == 'error':

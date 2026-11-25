@@ -77,12 +77,48 @@ class CommandTests(unittest.TestCase):
                 core.execute_command(self.host, self.pin, 'secret', script, False, timeout)
             connect.assert_not_called()
 
+    def test_working_directory_quoted_and_missing_directory_blocks_script(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder) / "folder ' ; $name"
+            directory.mkdir()
+            client = types.SimpleNamespace(close=lambda: None)
+            def run(client, command, **kwargs):
+                result = subprocess.run(['/bin/bash', '-c', command], capture_output=True, text=True,
+                                        env=dict(os.environ, HOME=folder))
+                return result.returncode, result.stdout + result.stderr
+            with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run', run):
+                result = core.execute_command(self.host, self.pin, 'secret', 'pwd', cwd="~/folder ' ; $name")
+                self.assertTrue(result['ok'])
+                self.assertEqual(result['output'].strip(), str(directory))
+                marker = Path(folder) / 'marker'
+                result = core.execute_command(self.host, self.pin, 'secret', 'touch ' + str(marker), cwd='~/missing')
+                self.assertFalse(result['ok'])
+                self.assertFalse(marker.exists())
+
+    def test_sudo_changes_directory_before_privilege_escalation(self):
+        import shlex
+        client = types.SimpleNamespace(close=lambda: None)
+        with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run', return_value=(0, 'ok')) as run:
+            result = core.execute_command(self.host, self.pin, 'secret', "sh './setup.sh'", True, cwd='~/lesson files')
+        self.assertTrue(result['ok'])
+        outer = shlex.split(run.call_args.args[1])[-1]
+        self.assertTrue(outer.startswith('cd -- "$HOME"/'))
+        self.assertLess(outer.index(' && '), outer.index('sudo'))
+        self.assertNotIn('secret', outer)
+
+    def test_invalid_directory_never_connects(self):
+        for value in ['', 'relative/path', '~root', '/tmp/../etc', '~/bad\npath', '/tmp/\x00']:
+            with self.subTest(value=value), patch.object(core, 'connect_verified') as connect, self.assertRaises(ValueError):
+                core.execute_command(self.host, self.pin, 'secret', 'id', cwd=value)
+            connect.assert_not_called()
+
 
 class UploadTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        self.base = Path(self.temp.name).resolve()
         self.home = self.base / 'remote-home'
         self.home.mkdir()
         self.source = self.base / "app 'test';$.deb"
@@ -93,8 +129,9 @@ class UploadTests(unittest.TestCase):
             def normalize(self, path): return str(outer.home)
             def lstat(self, path): return Path(path).lstat()
             def mkdir(self, path, mode): Path(path).mkdir(mode=mode)
-            def put(self, source, path, confirm):
+            def put(self, source, path, confirm, callback):
                 shutil.copyfile(source, path)
+                callback(Path(source).stat().st_size, Path(source).stat().st_size)
                 if getattr(outer, 'tamper', False):
                     Path(path).write_bytes(b'changed')
             def chmod(self, path, mode): Path(path).chmod(mode)
@@ -104,9 +141,9 @@ class UploadTests(unittest.TestCase):
             def close(self): pass
         self.client = types.SimpleNamespace(open_sftp=lambda: SFTP(), close=lambda: None)
 
-    def upload(self):
+    def upload(self, destination=None, progress=None):
         with patch.object(core, 'connect_verified', return_value=self.client):
-            return core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', [str(self.source)], 'batch-123')
+            return core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', [str(self.source)], 'batch-123', destination=destination, progress=progress)
 
     def test_files_hash_checked_and_not_executed(self):
         result = self.upload()
@@ -133,6 +170,43 @@ class UploadTests(unittest.TestCase):
         outside.mkdir()
         (self.home / 'CM-Inbox').symlink_to(outside)
         self.assertFalse(self.upload()['ok'])
+        self.assertFalse(list(outside.iterdir()))
+
+    def test_custom_directory_progress_and_existing_file_protected(self):
+        events = []
+        destination = "~/Рабочие файлы/'$;test"
+        result = self.upload(destination, events.append)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(Path(result['destination']), self.home / "Рабочие файлы/'$;test")
+        self.assertEqual(events[-1]['done'], self.source.stat().st_size * 3)
+        self.assertEqual(events[-1]['done'], events[-1]['total'])
+        self.assertEqual({e['phase'] for e in events}, {'Подключение и проверка имени/ОС', 'Подготовка SHA-256', 'Передача', 'Проверка SHA-256 на ПК', 'Готово'})
+        target = Path(result['files'][0]['path'])
+        target.write_bytes(b'keep existing')
+        self.assertFalse(self.upload(destination)['ok'])
+        self.assertEqual(target.read_bytes(), b'keep existing')
+
+    def test_empty_file_and_missing_directory(self):
+        self.source.write_bytes(b'')
+        events = []
+        self.assertTrue(self.upload('~/new/nested', events.append)['ok'])
+        self.assertEqual(events[-1]['phase'], 'Готово')
+        self.assertEqual(events[-1]['total'], 0)
+
+    def test_existing_temporary_file_preserved(self):
+        directory = self.home / 'lesson'
+        directory.mkdir()
+        temporary = directory / (self.source.name + '.batch-123.part')
+        temporary.write_bytes(b'preserve')
+        result = self.upload('~/lesson')
+        self.assertFalse(result['ok'])
+        self.assertEqual(temporary.read_bytes(), b'preserve')
+
+    def test_custom_symlink_directory_rejected(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (self.home / 'link').symlink_to(outside)
+        self.assertFalse(self.upload('~/link/nested')['ok'])
         self.assertFalse(list(outside.iterdir()))
 
 
