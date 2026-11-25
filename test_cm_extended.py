@@ -554,5 +554,227 @@ class DispatchTests(unittest.TestCase):
 
 
 
+
+class ConcurrentOperationsTests(unittest.TestCase):
+    def app(self, directory):
+        from unittest.mock import Mock
+        app = gui.Manager.__new__(gui.Manager)
+        app.data = Path(directory)
+        app.operations, app.shutdown = gui.OperationBook(), core.OperationControl()
+        app.busy, app.closing, app.preparing_operation = False, False, None
+        app.events = __import__('queue').Queue()
+        app.job, app.last_results = {}, []
+        app.statuses, app.trusted, app.catalog, app.last_ips = {}, {}, {}, {}
+        app.selected = set()
+        app.last_upload_directory = None
+        app.hosts = [core.Host('a209-01', '', '209'), core.Host('a209-02', '', '209'), core.Host('a208-01', '', '208')]
+        app.visible = lambda: app.hosts
+        app.window = types.SimpleNamespace(after=Mock(), destroy=Mock())
+        app.summary = types.SimpleNamespace(set=Mock())
+        app.delay = types.SimpleNamespace(get=lambda: '1')
+        class Widget:
+            def __init__(self): self.options = dict(mode='indeterminate')
+            def configure(self, **kwargs): self.options.update(kwargs)
+            def __getitem__(self, key): return self.options[key]
+            def start(self, *args): pass
+            def stop(self): pass
+        app.progress, app.room_box, app.delay_box = Widget(), Widget(), Widget()
+        app.action_button, app.edit_button = Widget(), Widget()
+        app.controls = [app.action_button, app.edit_button]
+        app.inventory_controls = [app.edit_button]
+        app.table = types.SimpleNamespace(exists=lambda name: True, set=Mock())
+        app.refresh = Mock()
+        app.get_password = lambda: 'test-password'
+        return app
+
+    def process_until(self, app, condition):
+        import time
+        deadline = time.monotonic() + 4
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail('Operation event did not arrive')
+            kind, value = app.events.get(timeout=2)
+            identifier = None
+            if kind == 'operation_event':
+                identifier, kind, value = value
+            app.handle_event(kind, value, identifier)
+
+    def test_slow_distribution_allows_command_on_finished_host_and_keeps_reports_separate(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            path = Path(directory) / 'setup.sh'
+            path.write_text('lesson')
+            slow_started, release_slow = threading.Event(), threading.Event()
+            def probe(host, **kwargs):
+                return dict(name=host.name, ip='192.168.22.1', ok=True, type='ssh-ed25519', key='key')
+            def transfer(host, pin, password, paths, batch, progress, **kwargs):
+                progress(dict(phase='Передача', file='lesson.txt', done=1, total=10))
+                if host.name == 'a209-02':
+                    slow_started.set()
+                    if not release_slow.wait(4):
+                        raise RuntimeError('test timeout')
+                return dict(name=host.name, ip=pin['ip'], action='upload', ok=True, files=[dict(path='/home/user/Desktops/Desktop1/CM-Inbox/setup.sh', sha256='a' * 64, bytes=6)], message='Передано')
+            def command(host, pin, password, script, sudo, timeout, progress, **kwargs):
+                self.assertEqual(script, 'hostname')
+                progress(dict(phase='Выполняется', elapsed=1, output='hostname output'))
+                return dict(name=host.name, ip=pin['ip'], action='command', ok=True, message='Команда завершена')
+            with patch.object(gui, 'probe', probe), patch.object(gui, 'classify_key', return_value='trusted'), patch.object(gui.messagebox, 'askokcancel', return_value=True), patch.object(gui, 'transfer_files', transfer), patch.object(gui, 'execute_command', command):
+                try:
+                    app.selected = {'a209-01', 'a209-02'}
+                    app.begin('distribute', dict(files=[str(path)], destination=core.DEFAULT_INBOX))
+                    first = next(iter(app.operations.active))
+                    self.process_until(app, lambda: 'a209-01' not in app.operations.owners)
+                    self.assertTrue(slow_started.wait(2))
+                    self.assertIn('a209-01', app.transferred_files()[('setup.sh', 'a' * 64)])
+                    self.assertFalse(app.busy)
+                    self.assertEqual(app.action_button.options['state'], 'normal')
+                    self.assertEqual(app.edit_button.options['state'], 'disabled')
+                    app.select_visible()
+                    self.assertNotIn('a209-02', app.selected)
+                    app.selected = {'a209-02'}
+                    with patch.object(gui.threading, 'Thread') as thread, patch.object(gui.messagebox, 'showinfo'):
+                        app.begin('command', dict(script='hostname', sudo=False, timeout=30, cwd='~'))
+                    thread.assert_not_called()
+                    app.selected = {'a209-01'}
+                    app.begin('command', dict(script='hostname', sudo=False, timeout=30, cwd='~'))
+                    second = next(identifier for identifier in app.operations.active if identifier != first)
+                    self.process_until(app, lambda: second not in app.operations.active)
+                    self.assertIn(first, app.operations.active)
+                    self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
+                    # A late packet from the older batch cannot overwrite this new result.
+                    app.handle_event('distribution_progress', dict(name='a209-01', phase='OLD', done=9, total=10), first)
+                    self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
+                finally:
+                    release_slow.set()
+                self.process_until(app, lambda: not app.operations.active)
+            self.assertEqual(app.operations.owners, {})
+            self.assertEqual(app.edit_button.options['state'], 'normal')
+            reports = [json.loads(p.read_text()) for p in (app.data / 'reports').glob('*.json')]
+            self.assertEqual(sorted(len(rows) for rows in reports), [1, 2])
+            self.assertTrue(any(rows[0]['action'] == 'command' for rows in reports))
+            self.assertNotIn('test-password', json.dumps(reports))
+
+    def test_finishing_old_operation_preserves_new_preparation_and_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            old = app.operations.start('distribute', app.hosts[:1], dict(files=['first']))
+            old['state'] = 'running'
+            new = app.operations.start('command', app.hosts[1:2], dict(script='new-script'))
+            app.preparing_operation, app.busy = new['id'], True
+            app.handle_event('finished', ([dict(name='a209-01', ok=True)], 'report.json'), old['id'])
+            self.assertTrue(app.busy)
+            self.assertEqual(app.preparing_operation, new['id'])
+            self.assertEqual(new['job']['script'], 'new-script')
+            self.assertEqual(app.operations.owners, {'a209-02': new['id']})
+            self.assertEqual(app.action_button.options['state'], 'disabled')
+            with patch.object(gui.messagebox, 'showerror'):
+                app.handle_event('error', 'old event', old['id'])
+            self.assertIn(new['id'], app.operations.active)
+
+    def test_exit_refusal_keeps_work_and_exit_confirmation_cancels_and_reports(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            operation = app.operations.start('distribute', app.hosts[:2], dict(files=['lesson']))
+            operation['state'] = 'running'
+            operation['results'].append(dict(name='a209-01', ok=True, message='Передано'))
+            app.operations.release(operation['id'], 'a209-01')
+            client = types.SimpleNamespace(close=Mock())
+            app.shutdown.add(client)
+            with patch.object(gui.messagebox, 'askyesno', return_value=False) as ask:
+                app.close()
+            self.assertEqual(ask.call_args.kwargs['default'], 'no')
+            self.assertIn('a209-02', ask.call_args.args[1])
+            self.assertFalse(app.shutdown.cancelled.is_set())
+            self.assertFalse(app.closing)
+            client.close.assert_not_called()
+            app.window.destroy.assert_not_called()
+            with patch.object(gui.messagebox, 'askyesno', return_value=True) as ask:
+                app.close()
+            self.assertIn('могут продолжить', ask.call_args.args[1])
+            client.close.assert_called_once()
+            app.window.destroy.assert_called_once()
+            self.assertTrue(app.shutdown.cancelled.is_set())
+            reports = list((app.data / 'reports').glob('*-interrupted-*.json'))
+            self.assertEqual(len(reports), 1)
+            rows = json.loads(reports[0].read_text())
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(rows[0]['ok'])
+            self.assertFalse(rows[1]['ok'])
+            self.assertIn('не подтверждён', rows[1]['message'])
+            with patch.object(gui.messagebox, 'askyesno') as ask:
+                app.close()
+            ask.assert_not_called()
+
+    def test_idle_exit_has_no_prompt_but_busy_scanner_requires_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            with patch.object(gui.messagebox, 'askyesno') as ask:
+                app.close()
+            ask.assert_not_called()
+            app.window.destroy.assert_called_once()
+            app = self.app(directory)
+            app.busy = True
+            with patch.object(gui.messagebox, 'askyesno', return_value=False) as ask:
+                app.close()
+            ask.assert_called_once()
+            app.window.destroy.assert_not_called()
+
+    def test_exit_cancels_worker_waiting_for_overwrite_answer(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            path = Path(directory) / 'lesson.txt'
+            path.write_text('lesson')
+            def transfer(host, pin, password, paths, batch, on_conflict, **kwargs):
+                on_conflict('/home/user/lesson.txt')
+                raise AssertionError('Cancellation should interrupt the wait')
+            pin = dict(name='a209-01', ip='192.168.22.1')
+            with patch.object(gui, 'transfer_files', transfer):
+                thread = threading.Thread(target=app.send, args=({'a209-01': app.hosts[0]}, [pin], 'test-password', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), app.events, app.shutdown))
+                thread.start()
+                while True:
+                    kind, value = app.events.get(timeout=2)
+                    if kind == 'overwrite':
+                        break
+                app.shutdown.cancel()
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+            reports = list((app.data / 'reports').glob('*.json'))
+            self.assertEqual(len(reports), 1)
+            self.assertFalse(json.loads(reports[0].read_text())[0]['ok'])
+
+    def test_cancel_closes_live_command_and_prevents_a_new_command(self):
+        import threading
+        from unittest.mock import Mock
+        control = core.OperationControl()
+        started, closed = threading.Event(), threading.Event()
+        channel = types.SimpleNamespace(exec_command=lambda command: started.set(), shutdown_write=lambda: None,
+                                        recv_ready=lambda: False, recv_stderr_ready=lambda: False,
+                                        exit_status_ready=lambda: False, close=closed.set)
+        open_session = Mock(return_value=channel)
+        client = types.SimpleNamespace(get_transport=lambda: types.SimpleNamespace(open_session=open_session), close=Mock())
+        control.add(client)
+        errors = []
+        def execute():
+            try:
+                core.run(client, 'sleep 100', timeout=300, control=control)
+            except RuntimeError as error:
+                errors.append(str(error))
+        thread = threading.Thread(target=execute)
+        thread.start()
+        self.assertTrue(started.wait(2))
+        control.cancel()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(closed.is_set())
+        client.close.assert_called_once()
+        self.assertTrue(errors)
+        with self.assertRaises(RuntimeError):
+            core.run(client, 'another', control=control)
+        open_session.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

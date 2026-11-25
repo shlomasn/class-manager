@@ -14,6 +14,42 @@ import time
 import threading
 
 
+class OperationControl:
+    """Close live connections and stop queued work when the user exits."""
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
+        self.clients = {}
+
+    def check(self):
+        if self.cancelled.is_set():
+            raise RuntimeError('Операция остановлена при закрытии CM; проверьте ПК перед повтором')
+
+    def add(self, client):
+        with self.lock:
+            stopped = self.cancelled.is_set()
+            if not stopped:
+                self.clients[id(client)] = client
+        if stopped:
+            client.close()
+            self.check()
+
+    def discard(self, client):
+        with self.lock:
+            self.clients.pop(id(client), None)
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled.set()
+            clients = list(self.clients.values())
+            self.clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 @dataclass(frozen=True)
 class Host:
     name: str
@@ -158,13 +194,17 @@ def fingerprint(key):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip('=')
 
 
-def probe(host):
+def probe(host, control=None):
     import paramiko
     transport = None
     try:
+        if control:
+            control.check()
         ip = resolve(host)
         sock = socket.create_connection((ip, 22), timeout=3)
         transport = paramiko.Transport(sock)
+        if control:
+            control.add(transport)
         transport.start_client(timeout=6)
         key = transport.get_remote_server_key()
         return dict(name=host.name, ip=ip, ok=True, type=key.get_name(), key=key.get_base64(), fingerprint=fingerprint(key))
@@ -175,6 +215,8 @@ def probe(host):
     finally:
         if transport:
             transport.close()
+            if control:
+                control.discard(transport)
 
 
 def same_key(left, right):
@@ -189,9 +231,13 @@ def classify_key(row, trusted, catalog):
     return 'trusted' if previous else 'new'
 
 
-def run(client, command, password=None, timeout=25, on_progress=None):
+def run(client, command, password=None, timeout=25, on_progress=None, control=None):
+    if control:
+        control.check()
     channel = client.get_transport().open_session(timeout=8)
     try:
+        if control:
+            control.check()
         channel.exec_command(command)
         # Do not request a PTY. Never put the password in command arguments.
         if password is not None:
@@ -202,6 +248,8 @@ def run(client, command, password=None, timeout=25, on_progress=None):
         last_progress = started - 1
         output = bytearray()
         while time.monotonic() < deadline:
+            if control:
+                control.check()
             while channel.recv_ready():
                 output.extend(channel.recv(8192))
                 if len(output) > 64 * 1024:
@@ -235,7 +283,7 @@ def power_command(action, minutes):
     return command + flag + ' ' + ('now' if minutes == 0 else '+' + str(minutes)) + ' ' + shlex.quote(text)
 
 
-def execute(host, pin, password, action, minutes):
+def execute(host, pin, password, action, minutes, control=None):
     import paramiko
     if not password or '\n' in password or '\r' in password:
         raise ValueError('Некорректный пароль')
@@ -244,20 +292,23 @@ def execute(host, pin, password, action, minutes):
     result = dict(name=host.name, ip=ip, action=action, ok=False)
     power_started = False
     client = paramiko.SSHClient()
+    options = dict(control=control) if control else {}
     try:
+        if control:
+            control.add(client)
         key = decode_key(pin)
         client.get_host_keys().add(ip, pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         client.connect(ip, username='user', password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=6, auth_timeout=8)
-        code, actual = run(client, '/bin/hostname -s')
+        code, actual = run(client, '/bin/hostname -s', **options)
         if code != 0 or actual.strip().lower() != host.name:
             raise RuntimeError('Имя ПК не совпало; команда питания не отправлена')
-        code, version = run(client, '/usr/bin/cat /etc/astra/build_version')
+        code, version = run(client, '/usr/bin/cat /etc/astra/build_version', **options)
         if code != 0 or not version.strip().startswith('1.8.4.'):
             raise RuntimeError('Не подтверждена Astra Linux 1.8.4; команда не отправлена')
         power_started = True
-        code, text = run(client, command, password=password)
+        code, text = run(client, command, password=password, **options)
         if code == -1:
             raise RuntimeError('Соединение закрыто без подтверждения; ПК мог уже выключиться или перезагрузиться. Проверьте перед повтором')
         if code != 0:
@@ -277,31 +328,38 @@ def execute(host, pin, password, action, minutes):
         result['message'] = str(error).replace(password, '[СКРЫТО]')
     finally:
         client.close()
+        if control:
+            control.discard(client)
     return result
 
 
-def connect_verified(host, pin, password):
+def connect_verified(host, pin, password, control=None):
     """Pinned SSH and host/OS checks shared by upload and command operations."""
     import paramiko
     if not password or '\n' in password or '\r' in password:
         raise ValueError('Некорректный пароль')
     ip = school_ip(pin['ip'])
     client = paramiko.SSHClient()
+    options = dict(control=control) if control else {}
     try:
+        if control:
+            control.add(client)
         key = decode_key(pin)
         client.get_host_keys().add(ip, pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         client.connect(ip, username='user', password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=6, auth_timeout=8)
-        code, actual = run(client, '/bin/hostname -s')
+        code, actual = run(client, '/bin/hostname -s', **options)
         if code != 0 or actual.strip().lower() != host.name:
             raise RuntimeError('Имя ПК не совпало; операция не выполнялась')
-        code, version = run(client, '/usr/bin/cat /etc/astra/build_version')
+        code, version = run(client, '/usr/bin/cat /etc/astra/build_version', **options)
         if code != 0 or not version.strip().startswith('1.8.4.'):
             raise RuntimeError('Не подтверждена Astra Linux 1.8.4; операция не выполнялась')
         return client
     except BaseException:
         client.close()
+        if control:
+            control.discard(client)
         raise
 
 
@@ -374,7 +432,7 @@ def ensure_remote_directory(sftp, destination, reject_existing=False):
             sftp.mkdir(current, 0o700)
 
 
-def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None, progress=None):
+def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None, progress=None, control=None):
     if not script.strip() or len(script.encode('utf-8')) > 32 * 1024 or '\x00' in script:
         raise ValueError('Введите команду длиной до 32 КБ без NUL')
     if type(timeout) is not int or not 10 <= timeout <= 1800:
@@ -397,11 +455,12 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
             progress(dict(phase=phase, elapsed=elapsed, output=safe))
     notify('Подключение и проверка имени/ОС')
     try:
-        client = connect_verified(host, pin, password)
+        connection = dict(control=control) if control else {}
+        client = connect_verified(host, pin, password, **connection)
         if expected_file is not None:
             notify('Проверка переданного файла SHA-256')
             check = '/usr/bin/sha256sum -- ' + shell_directory(expected_file['path'])
-            code, digest = run(client, check)
+            code, digest = run(client, check, **connection)
             if code != 0 or digest.split()[:1] != [expected_file['sha256']]:
                 raise RuntimeError('Переданный файл отсутствует или изменился; запуск отменён')
             result['expected_file'] = expected_file
@@ -409,7 +468,7 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
         if cwd is not None:
             command = '/bin/bash -c ' + shlex.quote('cd -- ' + shell_directory(cwd) + ' && ' + command)
         notify('Выполняется')
-        options = dict(password=password if sudo else None, timeout=timeout)
+        options = dict(password=password if sudo else None, timeout=timeout, **connection)
         if progress:
             options['on_progress'] = lambda value: notify('Выполняется', value['elapsed'], value['output'])
         code, output = run(client, command, **options)
@@ -426,6 +485,8 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
     finally:
         if client:
             client.close()
+            if control:
+                control.discard(client)
     return result
 
 
@@ -440,7 +501,7 @@ def _digest_stream(stream, progress=None):
             progress(len(chunk))
 
 
-def transfer_files(host, pin, password, paths, batch, destination=None, progress=None, on_conflict=None, access_gate=None, prepared=None):
+def transfer_files(host, pin, password, paths, batch, destination=None, progress=None, on_conflict=None, access_gate=None, prepared=None, control=None):
     import posixpath
     import stat
     if not re.fullmatch(r'[A-Za-z0-9-]{1,80}', batch) or not 1 <= len(paths) <= 20:
@@ -458,6 +519,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
     done = 0
     def notify(phase, filename='', delta=0):
         nonlocal done
+        if control:
+            control.check()
         done += delta
         if progress:
             progress(dict(phase=phase, file=filename, done=done, total=total, destination=result['destination']))
@@ -465,7 +528,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
     client = None
     sftp = None
     try:
-        client = access_gate.connect(host, pin, password) if access_gate else connect_verified(host, pin, password)
+        connection = dict(control=control) if control else {}
+        client = access_gate.connect(host, pin, password) if access_gate else connect_verified(host, pin, password, **connection)
         sftp = client.open_sftp()
         sftp.get_channel().settimeout(60)
         home = sftp.normalize('.')
@@ -553,6 +617,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
             sftp.close()
         if client:
             client.close()
+            if control:
+                control.discard(client)
     return result
 
 
@@ -583,13 +649,17 @@ def parse_addresses(text, limit=512):
     return sorted(addresses, key=lambda value: int(ipaddress.IPv4Address(value)))
 
 
-def probe_address(ip):
+def probe_address(ip, control=None):
     # No authentication or mutation during the first scan phase.
     import paramiko
     transport = None
     try:
+        if control:
+            control.check()
         ip = school_ip(ip)
         transport = paramiko.Transport(socket.create_connection((ip, 22), timeout=1.5))
+        if control:
+            control.add(transport)
         transport.start_client(timeout=4)
         key = transport.get_remote_server_key()
         return dict(ip=ip, ok=True, type=key.get_name(), key=key.get_base64(), fingerprint=fingerprint(key))
@@ -598,26 +668,31 @@ def probe_address(ip):
     finally:
         if transport:
             transport.close()
+            if control:
+                control.discard(transport)
 
 
-def inspect_address(pin, password):
+def inspect_address(pin, password, control=None):
     """Get the actual hostname through pinned SSH; never trust PTR as identity."""
     if not password or "\n" in password or "\r" in password:
         raise ValueError("Некорректный пароль")
     import paramiko
     client = paramiko.SSHClient()
     result = dict(pin, ok=False)
+    options = dict(control=control) if control else {}
     try:
+        if control:
+            control.add(client)
         key = decode_key(pin)
         client.get_host_keys().add(pin['ip'], pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         client.connect(pin['ip'], username='user', password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=5, auth_timeout=8)
-        code, actual = run(client, '/bin/hostname -s')
+        code, actual = run(client, '/bin/hostname -s', **options)
         name = hostname(actual.strip())
         if code != 0 or name != actual.strip().lower():
             raise RuntimeError('Имя ПК не подходит; требуется проверка имени')
-        code, version = run(client, '/usr/bin/cat /etc/astra/build_version')
+        code, version = run(client, '/usr/bin/cat /etc/astra/build_version', **options)
         if code != 0 or not version.strip().startswith('1.8.4.'):
             raise RuntimeError('Не подтверждена Astra Linux 1.8.4')
         mode = 'fixed'
@@ -631,6 +706,8 @@ def inspect_address(pin, password):
         operation_error(result, error, password)
     finally:
         client.close()
+        if control:
+            control.discard(client)
     return result
 
 
@@ -640,11 +717,14 @@ class TransferStopped(RuntimeError):
 
 class TransferAccessGate:
     """Serialize password attempts only; file transfers run concurrently."""
-    def __init__(self):
+    def __init__(self, control=None):
+        self.control = control
         self.lock = threading.Lock()
         self.stopped = threading.Event()
 
     def check(self):
+        if self.control:
+            self.control.check()
         if self.stopped.is_set():
             raise TransferStopped('Пропущен после ошибки доступа; повторных попыток нет')
 
@@ -653,7 +733,8 @@ class TransferAccessGate:
         with self.lock:
             self.check()
             try:
-                return connect_verified(host, pin, password)
+                options = dict(control=self.control) if self.control else {}
+                return connect_verified(host, pin, password, **options)
             except paramiko.AuthenticationException:
                 self.stopped.set()
                 raise

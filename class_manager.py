@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +22,49 @@ ROOT = Path(__file__).resolve().parent
 def data_directory():
     base = Path(os.environ.get('APPDATA', str(Path.home() / '.local/share')))
     return base / 'CM-Astra'
+
+
+class OperationBook:
+    """Main-thread operation state; ownership is released per finished computer."""
+    def __init__(self):
+        self.active = {}
+        self.owners = {}
+
+    def start(self, action, hosts, job):
+        names = {host.name for host in hosts}
+        conflicts = names.intersection(self.owners)
+        if conflicts:
+            raise ValueError('Эти ПК уже заняты: ' + ', '.join(sorted(conflicts)) + '. Выберите свободные ПК.')
+        identifier = uuid.uuid4().hex
+        operation = dict(id=identifier, action=action, job=dict(job or {}), pending=names,
+                         state='preparing', progress={}, results=[])
+        self.active[identifier] = operation
+        for name in names:
+            self.owners[name] = identifier
+        return operation
+
+    def release(self, identifier, name):
+        operation = self.active.get(identifier)
+        if operation:
+            operation['pending'].discard(name)
+        if self.owners.get(name) == identifier:
+            del self.owners[name]
+
+    def finish(self, identifier):
+        operation = self.active.get(identifier)
+        if operation:
+            for name in list(operation['pending']):
+                self.release(identifier, name)
+            del self.active[identifier]
+
+
+class OperationEvents:
+    def __init__(self, queue, identifier):
+        self.queue, self.identifier = queue, identifier
+
+    def put(self, event):
+        kind, value = event
+        self.queue.put(('operation_event', (self.identifier, kind, value)))
 
 
 class Manager:
@@ -41,7 +84,11 @@ class Manager:
         self.trusted = json.loads(self.trust_file.read_text(encoding='utf-8')) if self.trust_file.exists() else {}
         self.trusted = {value.get('name', key): value for key, value in self.trusted.items()}
         self.last_upload_directory = None
-        self.job = {}
+        self.operations = OperationBook()
+        self.shutdown = OperationControl()
+        self.closing = False
+        self.preparing_operation = None
+        self.inventory_controls = []
         self.last_results = []
         self.last_ips = {}
         self.selected = set()
@@ -49,7 +96,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.6 — управление школьными компьютерами')
+        window.title('CM Astra 1.7 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -67,7 +114,7 @@ class Manager:
         outer = ttk.Frame(self.window, padding=18)
         outer.pack(fill='both', expand=True)
         ttk.Label(outer, text='Управление компьютерами Astra Linux', font=('Segoe UI', 17, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='Отметьте нужные компьютеры. Команды отправляются через SSH от имени локального user.').pack(anchor='w', pady=(5, 15))
+        ttk.Label(outer, text='Отметьте свободные ПК. Завершившие работу ПК доступны сразу; остальные операции продолжаются в фоне.').pack(anchor='w', pady=(5, 15))
         toolbar = ttk.Frame(outer)
         toolbar.pack(fill='x', pady=(0, 10))
         ttk.Label(toolbar, text='Кабинет:').pack(side='left', padx=(0, 6))
@@ -77,18 +124,18 @@ class Manager:
         self.room_box.bind('<<ComboboxSelected>>', lambda event: self.change_room())
         self.button(toolbar, 'Выбрать все в списке', self.select_visible)
         self.button(toolbar, 'Снять выбор', self.clear_selection)
-        self.button(toolbar, 'Открыть .lst / .json', self.import_list)
+        self.inventory_controls.append(self.button(toolbar, 'Открыть .lst / .json', self.import_list))
         editing = ttk.Frame(outer)
         editing.pack(fill='x', pady=(0, 10))
-        self.button(editing, 'Добавить ПК', self.add_host)
-        self.button(editing, 'Изменить ПК', self.edit_host)
-        self.button(editing, 'Удалить отмеченные', self.remove_hosts)
+        self.inventory_controls.append(self.button(editing, 'Добавить ПК', self.add_host))
+        self.inventory_controls.append(self.button(editing, 'Изменить ПК', self.edit_host))
+        self.inventory_controls.append(self.button(editing, 'Удалить отмеченные', self.remove_hosts))
         groups = ttk.Frame(outer)
         groups.pack(fill='x', pady=(0, 10))
-        self.button(groups, 'Добавить класс', self.add_room)
-        self.button(groups, 'Удалить класс', self.remove_room)
-        self.button(groups, 'Перенести отмеченные в класс…', self.move_hosts)
-        self.button(groups, 'Поиск по диапазону IP…', self.scan_range)
+        self.inventory_controls.append(self.button(groups, 'Добавить класс', self.add_room))
+        self.inventory_controls.append(self.button(groups, 'Удалить класс', self.remove_room))
+        self.inventory_controls.append(self.button(groups, 'Перенести отмеченные в класс…', self.move_hosts))
+        self.inventory_controls.append(self.button(groups, 'Поиск по диапазону IP…', self.scan_range))
         table_frame = ttk.Frame(outer)
         table_frame.pack(fill='both', expand=True)
         columns = ('check', 'name', 'ip', 'status')
@@ -171,6 +218,10 @@ class Manager:
         return 'break'
 
     def toggle(self, name):
+        owners = getattr(getattr(self, 'operations', None), 'owners', {})
+        if name in owners and name not in self.selected:
+            messagebox.showinfo('Компьютер занят', name + ': дождитесь окончания его операции или выберите другой ПК.', parent=self.window)
+            return
         if name in self.selected:
             self.selected.remove(name)
         else:
@@ -179,7 +230,8 @@ class Manager:
         self.table.focus(name)
 
     def select_visible(self):
-        self.selected = {h.name for h in self.visible()}
+        occupied = getattr(getattr(self, 'operations', None), 'owners', {})
+        self.selected = {h.name for h in self.visible() if h.name not in occupied}
         self.refresh()
 
     def clear_selection(self):
@@ -414,6 +466,8 @@ class Manager:
             except (OSError, ValueError):
                 continue
         records.extend(self.last_results)
+        for operation in getattr(getattr(self, 'operations', None), 'active', {}).values():
+            records.extend(operation['results'])
         groups = {}
         for row in records:
             if not isinstance(row, dict) or row.get('action') not in ('upload', 'download'):
@@ -543,7 +597,9 @@ class Manager:
     def scan_worker(self, addresses):
         try:
             with ThreadPoolExecutor(max_workers=16) as pool:
-                rows = list(pool.map(probe_address, addresses))
+                control = getattr(self, 'shutdown', None)
+                options = dict(control=control) if control else {}
+                rows = list(pool.map(lambda ip: probe_address(ip, **options), addresses))
             self.events.put(('range_found', [row for row in rows if row['ok']]))
         except Exception as error:
             self.events.put(('error', str(error)))
@@ -573,7 +629,11 @@ class Manager:
         results = []
         try:
             for row in rows:
-                result = inspect_address(row, password)
+                control = getattr(self, 'shutdown', None)
+                options = dict(control=control) if control else {}
+                if control:
+                    control.check()
+                result = inspect_address(row, password, **options)
                 results.append(result)
                 self.events.put(('scan_progress', 'Проверено SSH-узлов: ' + str(len(results)) + ' из ' + str(len(rows))))
                 if result.get('stop'):
@@ -669,14 +729,16 @@ class Manager:
 
     def set_busy(self, value):
         self.busy = value
+        active = bool(getattr(getattr(self, 'operations', None), 'active', {}))
         for control in self.controls:
-            control.configure(state='disabled' if value else 'normal')
+            blocked = value or (active and control in self.inventory_controls)
+            control.configure(state='disabled' if blocked else 'normal')
         self.room_box.configure(state='disabled' if value else 'readonly')
         self.delay_box.configure(state='disabled' if value else 'readonly')
         if value:
             self.progress.configure(mode='indeterminate', value=0, maximum=100)
             self.progress.start(12)
-        else:
+        elif not active:
             self.progress.stop()
 
     def begin(self, action, job=None):
@@ -688,20 +750,60 @@ class Manager:
             messagebox.showerror('Выбор ПК изменился', 'Подготовьте запуск файла заново для текущего выбора ПК.', parent=self.window)
             return
         minutes = int(self.delay.get())
-        self.job = job or {}
+        try:
+            operation = self.operations.start(action, hosts, job)
+        except ValueError as error:
+            messagebox.showinfo('Компьютеры заняты', str(error), parent=self.window)
+            return
+        self.preparing_operation = operation['id']
         self.set_busy(True)
         self.summary.set('Проверка SSH без пароля…')
-        threading.Thread(target=self.discover, args=(hosts, action, minutes), daemon=True).start()
+        events = OperationEvents(self.events, operation['id'])
+        threading.Thread(target=self.discover, args=(hosts, action, minutes, events, self.shutdown), daemon=True).start()
 
-    def discover(self, hosts, action, minutes):
+    def finish_operation(self, identifier):
+        self.operations.finish(identifier)
+        if self.preparing_operation == identifier:
+            self.preparing_operation = None
+            self.busy = False
+        self.set_busy(self.busy)
+        if self.operations.active:
+            self.update_activity()
+
+    def update_activity(self):
+        active = self.operations.active
+        if not active:
+            return
+        count = len(self.operations.owners)
+        self.summary.set('Активных операций: ' + str(len(active)) + ' • Занято ПК: ' + str(count)
+                         + '. Можно работать с другими ПК; «Выбрать все» выбирает свободные.')
+        states = [state for op in active.values() for state in op['progress'].values()]
+        if states and all(op['action'] == 'distribute' and op['state'] == 'running' for op in active.values()):
+            self.progress.stop()
+            self.progress.configure(mode='determinate', maximum=100, value=sum(x['percent'] for x in states) / len(states))
+        elif str(self.progress['mode']) != 'indeterminate':
+            self.progress.stop()
+            self.progress.configure(mode='indeterminate', maximum=100, value=0)
+            self.progress.start(12)
+
+    def discover(self, hosts, action, minutes, events=None, control=None):
+        events = events or self.events
         try:
+            options = dict(control=control) if control else {}
             with ThreadPoolExecutor(max_workers=6) as pool:
-                rows = list(pool.map(probe, hosts))
-            self.events.put(('discovered', (hosts, action, minutes, rows)))
+                rows = list(pool.map(lambda host: probe(host, **options), hosts))
+            events.put(('discovered', (hosts, action, minutes, rows)))
         except Exception as error:
-            self.events.put(('error', str(error)))
+            events.put(('error', str(error)))
 
-    def discovered(self, hosts, action, minutes, rows):
+    def discovered(self, hosts, action, minutes, rows, operation_id=None):
+        operation = self.operations.active.get(operation_id) if operation_id else None
+        job = operation['job'] if operation else getattr(self, 'job', {})
+        def finish():
+            if operation_id:
+                self.finish_operation(operation_id)
+            else:
+                self.set_busy(False)
         permitted = []
         fresh = []
         initial_results = []
@@ -722,20 +824,24 @@ class Manager:
             permitted.append(row)
             if state == 'new':
                 fresh.append(row)
+        if operation_id:
+            operation['results'].extend(initial_results)
+            for result in initial_results:
+                self.operations.release(operation_id, result['name'])
         self.refresh()
         if action == 'scan':
-            self.set_busy(False)
+            finish()
             self.summary.set('Проверка завершена. SSH доступен: ' + str(len(permitted)) + ' из ' + str(len(rows)) + '. Команды питания не отправлялись.')
             return
         if not permitted:
-            self.set_busy(False)
+            finish()
             self.summary.set('Нет доступных компьютеров с подходящими SSH-ключами. Команды не отправлялись.')
             return
         if fresh:
             details = '\n'.join(r['name'] + '  ' + r['ip'] + '\n' + r['fingerprint'] for r in fresh)
             answer = self.trust_dialog(details)
             if not answer:
-                self.set_busy(False)
+                finish()
                 self.summary.set('Отменено. Пароль и команды питания не отправлялись.')
                 return
             for row in fresh:
@@ -748,30 +854,39 @@ class Manager:
             text += ('\n\nНЕМЕДЛЕННО, без возможности отмены после выполнения.' if minutes == 0 else '\n\nЧерез ' + str(minutes) + ' мин. после отправки каждому ПК.')
             text += ' Несохранённые данные будут потеряны.'
         if action == 'distribute':
-            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in self.job['files']) + '\nПапка на ученических ПК: ' + self.job['destination'] + '\n~ — домашняя папка user. При совпадении имени будет вопрос о перезаписи. Автоматического запуска нет.'
+            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in job['files']) + '\nПапка на ученических ПК: ' + job['destination'] + '\n~ — домашняя папка user. При совпадении имени будет вопрос о перезаписи. Автоматического запуска нет.'
         if action == 'command':
-            text += '\n\n' + ('ПРАВА ROOT (sudo)' if self.job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + self.job['cwd'] + '\n' + self.job['script'][:2000]
+            text += '\n\n' + ('ПРАВА ROOT (sudo)' if job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + job['cwd'] + '\n' + job['script'][:2000]
         if action == 'distribute':
             text += '\nФайлы раздаются всем выбранным ПК параллельно. После передачи проверяется SHA-256.'
-        if action == 'command' and self.job.get('targets'):
-            text += '\n\nПроверка SHA-256 и запуск файлов:\n' + '\n'.join(row['name'] + ': ' + self.job['targets'][row['name']]['expected_file']['path'] for row in permitted)
+        if action == 'command' and job.get('targets'):
+            text += '\n\nПроверка SHA-256 и запуск файлов:\n' + '\n'.join(row['name'] + ': ' + job['targets'][row['name']]['expected_file']['path'] for row in permitted)
         if initial_results:
             text += '\n\nНедоступные или заблокированные ПК пропущены: ' + str(len(initial_results)) + '.'
         if not messagebox.askokcancel('Подтверждение команды учителя', text, icon='warning', default='cancel', parent=self.window):
-            self.set_busy(False)
+            finish()
             self.summary.set('Отменено. Команды питания не отправлялись.')
             return
         password = self.get_password()
         if not password:
-            self.set_busy(False)
+            finish()
             self.summary.set('Отменено. Команды питания не отправлялись.')
             return
         if '\n' in password or '\r' in password:
-            self.set_busy(False)
+            finish()
             messagebox.showerror('Пароль', 'Пароль не должен содержать перевод строки.', parent=self.window)
             return
         self.summary.set('Передача файлов: подключение…' if action == 'distribute' else 'Выполнение: подключение…')
-        threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, self.job), daemon=True).start()
+        events = OperationEvents(self.events, operation_id) if operation_id else self.events
+        control = getattr(self, 'shutdown', None)
+        if operation:
+            operation['state'] = 'running'
+            self.preparing_operation = None
+            self.selected.difference_update(h.name for h in hosts)
+            self.set_busy(False)
+            self.refresh()
+            self.update_activity()
+        threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, job, events, control), daemon=True).start()
         password = None
 
     def trust_dialog(self, details):
@@ -802,23 +917,26 @@ class Manager:
         self.window.wait_window(dialog)
         return result[0]
 
-    def distribute_files(self, host_map, rows, password, job):
+    def distribute_files(self, host_map, rows, password, job, events=None, control=None):
+        events = events or self.events
         # Prepare each source once; every selected PC gets an independent SFTP session.
         total = sum(Path(path).stat().st_size for path in job['files'])
         done = 0
         last_prepare = 0
         def preparation(count):
             nonlocal done, last_prepare
+            if control:
+                control.check()
             done += count
             now = time.monotonic()
             if now - last_prepare >= .2:
-                self.events.put(('scan_progress', 'Подготовка файлов для всех ПК: SHA-256 ' + str(round(done * 100 / total) if total else 100) + '%'))
+                events.put(('scan_progress', 'Подготовка файлов для всех ПК: SHA-256 ' + str(round(done * 100 / total) if total else 100) + '%'))
                 last_prepare = now
-        self.events.put(('scan_progress', 'Подготовка файлов для одновременной раздачи…'))
+        events.put(('scan_progress', 'Подготовка файлов для одновременной раздачи…'))
         prepared = {str(Path(path).resolve()): prepare_transfer(path, progress=preparation) for path in job['files']}
         batch = job.get('batch') or uuid.uuid4().hex
-        gate = TransferAccessGate()
-        self.events.put(('distribution_started', [pin['name'] for pin in rows]))
+        gate = TransferAccessGate(control)
+        events.put(('distribution_started', [pin['name'] for pin in rows]))
         def worker(pin):
             name = pin['name']
             last_update = 0
@@ -828,21 +946,27 @@ class Manager:
                 now = time.monotonic()
                 stage = (value['phase'], value.get('file', ''))
                 if stage != last_phase or now - last_update >= .2:
-                    self.events.put(('distribution_progress', dict(value, name=name)))
+                    events.put(('distribution_progress', dict(value, name=name)))
                     last_update, last_phase = now, stage
             def on_conflict(path):
                 answer = queue.Queue(maxsize=1)
-                self.events.put(('overwrite', (name, path, answer)))
-                return answer.get()
+                events.put(('overwrite', (name, path, answer)))
+                while True:
+                    if control:
+                        control.check()
+                    try:
+                        return answer.get(timeout=.2)
+                    except queue.Empty:
+                        continue
             try:
                 result = transfer_files(host_map[name], pin, password, job['files'], batch,
                                         destination=job['destination'], progress=progress,
-                                        on_conflict=on_conflict, access_gate=gate, prepared=prepared)
+                                        on_conflict=on_conflict, access_gate=gate, prepared=prepared, **(dict(control=control) if control else {}))
             except Exception as error:
                 result = dict(name=name, ip=pin['ip'], action='upload', ok=False,
                               message=str(error).replace(password, '[СКРЫТО]'))
             result['requested_destination'] = job['destination']
-            self.events.put(('result', result))
+            events.put(('result', result))
             return result
         if not rows:
             return []
@@ -861,129 +985,217 @@ class Manager:
         self.summary.set('Раздача файлов: завершено ПК ' + str(complete) + '/' + str(len(state))
                          + '. Прогресс каждого ПК — в столбце «Состояние / результат».')
 
-    def send(self, host_map, rows, password, action, minutes, initial_results, job=None):
+    def send(self, host_map, rows, password, action, minutes, initial_results, job=None, events=None, control=None):
+        events = events or self.events
+        options = dict(control=control) if control else {}
         results = list(initial_results)
         try:
             if action == 'distribute':
-                results.extend(self.distribute_files(host_map, rows, password, job))
+                results.extend(self.distribute_files(host_map, rows, password, job, events, control))
             if action == 'command':
-                self.events.put(('command_waiting', [pin['name'] for pin in rows]))
+                events.put(('command_waiting', [pin['name'] for pin in rows]))
             for index, pin in enumerate([] if action == 'distribute' else rows):
+                if control:
+                    control.check()
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
-                self.events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
+                events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
                 if action == 'command':
                     target = job.get('targets', {}).get(pin['name'], {})
-                    self.events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + target.get('cwd', job.get('cwd', '~'))))
+                    events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + target.get('cwd', job.get('cwd', '~'))))
                     result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'],
                                              cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'),
-                                             progress=lambda value, name=pin['name']: self.events.put(('command_progress', dict(value, name=name))))
+                                             progress=lambda value, name=pin['name']: events.put(('command_progress', dict(value, name=name))), **options)
                 else:
-                    result = execute(host_map[pin['name']], pin, password, action, minutes)
+                    result = execute(host_map[pin['name']], pin, password, action, minutes, **options)
                 results.append(result)
-                self.events.put(('result', result))
+                events.put(('result', result))
                 if result.get('stop'):
                     for skipped in rows[index + 1:]:
                         result = dict(name=skipped['name'], ip=skipped['ip'], ok=False, message='Пропущен после ошибки доступа; повторных попыток нет')
                         results.append(result)
-                        self.events.put(('result', result))
+                        events.put(('result', result))
                     break
             report = self.data / 'reports' / (datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6] + '.json')
             atomic_json(report, results)
-            self.events.put(('finished', (results, str(report))))
+            events.put(('finished', (results, str(report))))
         except Exception as error:
-            self.events.put(('error', str(error).replace(password, '[СКРЫТО]')))
+            events.put(('error', str(error).replace(password, '[СКРЫТО]')))
         finally:
             password = None
 
+    def handle_event(self, kind, value, operation_id=None):
+        operation = self.operations.active.get(operation_id) if operation_id else None
+        if operation_id and operation is None:
+            if kind == 'overwrite':
+                value[2].put(False)
+            return
+        if operation_id and kind in ('result', 'command_progress', 'distribution_progress'):
+            if self.operations.owners.get(value['name']) != operation_id:
+                return  # Late events cannot replace a newer operation's row.
+        progress_state = operation['progress'] if operation else getattr(self, 'distribution_state', {})
+        def show_progress():
+            if operation_id:
+                self.update_activity()
+            else:
+                self.update_distribution_summary()
+        if kind == 'discovered':
+            self.discovered(*value, operation_id=operation_id) if operation_id else self.discovered(*value)
+        elif kind == 'result':
+            if value.get('action') in ('upload', 'download') and value['name'] in progress_state:
+                progress_state[value['name']] = dict(percent=100, complete=True)
+                show_progress()
+            if value.get('action') in ('upload', 'download') and value.get('files'):
+                self.last_upload_directory = value['requested_destination']
+            if operation_id:
+                operation['results'].append(value)
+                self.operations.release(operation_id, value['name'])
+            self.statuses[value['name']] = (value['message'], not value['ok'])
+            self.refresh()
+            if operation_id:
+                self.update_activity()
+        elif kind == 'finished':
+            results, report = value
+            self.last_results = results
+            good = sum(r['ok'] for r in results)
+            if operation_id:
+                self.finish_operation(operation_id)
+            else:
+                self.set_busy(False)
+            self.summary.set('Готово: успешно ' + str(good) + ', ошибок/пропусков ' + str(len(results) - good) + '. Отчёт: ' + report)
+            if operation_id and self.operations.active:
+                self.update_activity()
+        elif kind == 'command_waiting':
+            for name in value:
+                self.statuses[name] = ('Ожидает выполнения команды', False)
+            self.refresh()
+        elif kind == 'command_progress':
+            name = value['name']
+            output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value['output'])
+            lines = output.replace('\r', '\n').splitlines()
+            latest = next((line.strip() for line in reversed(lines) if line.strip()), '')
+            label = value['phase'] + ' • ' + str(value['elapsed']) + ' с'
+            if latest:
+                label += ' • ' + latest[:180]
+            else:
+                label += ' • ожидание вывода'
+            self.statuses[name] = (label, False)
+            if self.table.exists(name):
+                self.table.set(name, 'status', label)
+            self.summary.set(name + ': ' + label)
+        elif kind == 'distribution_started':
+            states = {name: dict(percent=0, complete=False) for name in value}
+            if operation:
+                operation['progress'] = states
+            else:
+                self.distribution_state = states
+            for name in value:
+                self.statuses[name] = ('Ожидает подключения для раздачи', False)
+            self.refresh()
+            show_progress()
+        elif kind == 'distribution_progress':
+            name = value['name']
+            state = progress_state.get(name)
+            if state is not None and not state['complete']:
+                percent = min(99, value['done'] * 100 / value['total']) if value['total'] else 0
+                state['percent'] = percent
+                label = value['phase'] + ' ' + value.get('file', '') + ' • ' + str(int(percent)) + '%'
+                self.statuses[name] = (label, False)
+                if self.table.exists(name):
+                    self.table.set(name, 'status', label)
+                show_progress()
+        elif kind == 'range_found':
+            self.range_found(value)
+        elif kind == 'range_inspected':
+            self.range_results(value)
+        elif kind == 'overwrite':
+            name, path, answer = value
+            try:
+                overwrite = messagebox.askyesno('Перезаписать файл?', name + '\nФайл уже существует:\n' + path + '\n\nЗаменить его выбранным файлом учителя? При ответе «Нет» этот файл будет пропущен.', default='no', icon='warning', parent=self.window)
+            except Exception:
+                answer.put(False)
+                raise
+            answer.put(overwrite)
+        elif kind == 'operation_status':
+            self.progress.stop()
+            self.progress.configure(mode='indeterminate', maximum=100, value=0)
+            self.progress.start(12)
+            self.summary.set(value)
+        elif kind == 'scan_progress':
+            self.summary.set(value)
+        elif kind == 'error':
+            if operation_id:
+                self.finish_operation(operation_id)
+            else:
+                self.set_busy(False)
+            self.summary.set('Операция завершилась с ошибкой; проверьте результаты перед повтором.')
+            messagebox.showerror('Ошибка', value, parent=self.window)
+
     def poll(self):
-        try:
-            while True:
+        if getattr(self, 'closing', False):
+            return
+        if getattr(self, 'asking_exit', False):
+            self.window.after(100, self.poll)
+            return
+        while not getattr(self, 'closing', False):
+            identifier = None
+            try:
                 kind, value = self.events.get_nowait()
-                if kind == 'discovered':
-                    self.discovered(*value)
-                elif kind == 'result':
-                    if value.get('action') in ('upload', 'download') and value['name'] in getattr(self, 'distribution_state', {}):
-                        self.distribution_state[value['name']] = dict(percent=100, complete=True)
-                        self.update_distribution_summary()
-                    if value.get('action') in ('upload', 'download') and value.get('files'):
-                        self.last_upload_directory = value['requested_destination']
-                    self.statuses[value['name']] = (value['message'], not value['ok'])
-                    self.refresh()
-                elif kind == 'finished':
-                    results, report = value
-                    self.last_results = results
-                    good = sum(r['ok'] for r in results)
+                if kind == 'operation_event':
+                    identifier, kind, value = value
+                self.handle_event(kind, value, identifier)
+            except queue.Empty:
+                break
+            except Exception as error:
+                if getattr(self, 'closing', False):
+                    return
+                if identifier:
+                    self.finish_operation(identifier)
+                else:
                     self.set_busy(False)
-                    self.summary.set('Готово: успешно ' + str(good) + ', ошибок/пропусков ' + str(len(results) - good) + '. Отчёт: ' + report)
-                elif kind == 'command_waiting':
-                    for name in value:
-                        self.statuses[name] = ('Ожидает выполнения команды', False)
-                    self.refresh()
-                elif kind == 'command_progress':
-                    name = value['name']
-                    output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value['output'])
-                    lines = output.replace('\r', '\n').splitlines()
-                    latest = next((line.strip() for line in reversed(lines) if line.strip()), '')
-                    label = value['phase'] + ' • ' + str(value['elapsed']) + ' с'
-                    if latest:
-                        label += ' • ' + latest[:180]
-                    else:
-                        label += ' • ожидание вывода'
-                    self.statuses[name] = (label, False)
-                    if self.table.exists(name):
-                        self.table.set(name, 'status', label)
-                    self.summary.set(name + ': ' + label)
-                elif kind == 'distribution_started':
-                    self.distribution_state = {name: dict(percent=0, complete=False) for name in value}
-                    for name in value:
-                        self.statuses[name] = ('Ожидает подключения для раздачи', False)
-                    self.refresh()
-                    self.update_distribution_summary()
-                elif kind == 'distribution_progress':
-                    name = value['name']
-                    state = self.distribution_state.get(name)
-                    if state is not None and not state['complete']:
-                        percent = min(99, value['done'] * 100 / value['total']) if value['total'] else 0
-                        state['percent'] = percent
-                        label = value['phase'] + ' ' + value.get('file', '') + ' • ' + str(int(percent)) + '%'
-                        self.statuses[name] = (label, False)
-                        if self.table.exists(name):
-                            self.table.set(name, 'status', label)
-                        self.update_distribution_summary()
-                elif kind == 'range_found':
-                    self.range_found(value)
-                elif kind == 'range_inspected':
-                    self.range_results(value)
-                elif kind == 'overwrite':
-                    name, path, answer = value
-                    try:
-                        overwrite = messagebox.askyesno('Перезаписать файл?', name + '\nФайл уже существует:\n' + path + '\n\nЗаменить его выбранным файлом учителя? При ответе «Нет» этот файл будет пропущен.', default='no', icon='warning', parent=self.window)
-                    except Exception:
-                        answer.put(False)
-                        raise
-                    answer.put(overwrite)
-                elif kind == 'operation_status':
-                    self.progress.stop()
-                    self.progress.configure(mode='indeterminate', maximum=100, value=0)
-                    self.progress.start(12)
-                    self.summary.set(value)
-                elif kind == 'scan_progress':
-                    self.summary.set(value)
-                elif kind == 'error':
-                    self.set_busy(False)
-                    self.summary.set('Операция завершилась с ошибкой; проверьте результаты перед повтором.')
-                    messagebox.showerror('Ошибка', value, parent=self.window)
-        except queue.Empty:
-            pass
-        except Exception as error:
-            self.set_busy(False)
-            messagebox.showerror('Ошибка', str(error), parent=self.window)
-        self.window.after(100, self.poll)
+                messagebox.showerror('Ошибка', str(error), parent=self.window)
+        if not getattr(self, 'closing', False):
+            self.window.after(100, self.poll)
 
     def close(self):
-        if self.busy:
-            messagebox.showinfo('Операция выполняется', 'Дождитесь окончания отправки команд. Запланированное выключение отменяется отдельной кнопкой.', parent=self.window)
+        if getattr(self, 'closing', False) or getattr(self, 'asking_exit', False):
             return
+        active = getattr(getattr(self, 'operations', None), 'active', {})
+        if active or self.busy:
+            titles = {'distribute': 'Раздача файлов', 'command': 'Выполнение команды',
+                      'off': 'Выключение', 'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи'}
+            details = []
+            for operation in active.values():
+                names = sorted(operation['pending'])
+                details.append(titles.get(operation['action'], operation['action']) + ': ' + str(len(names))
+                               + ' ПК — ' + ', '.join(names[:8]) + ('…' if len(names) > 8 else ''))
+            if self.busy and not getattr(self, 'preparing_operation', None):
+                details.append('Поиск или подготовка компьютеров ещё выполняется')
+            text = 'Ещё есть незавершённые операции:\n\n' + '\n'.join(details)
+            text += ('\n\nЗакрыть CM? Передачи будут прерваны. Уже отправленные команды установки '
+                     'или питания могут продолжить работу на ПК. Отчёт незавершённых операций '
+                     'будет сохранён; проверьте ПК перед повтором.')
+            self.asking_exit = True
+            try:
+                answer = messagebox.askyesno('Закрыть программу с незавершёнными операциями?', text,
+                                            icon='warning', default='no', parent=self.window)
+            finally:
+                self.asking_exit = False
+            if not answer:
+                return
+        self.closing = True
+        # Save uncertainty explicitly; a later result must never be invented as success.
+        for operation in list(active.values()):
+            results = list(operation['results'])
+            results.extend(dict(name=name, action=operation['action'], ok=False,
+                                message='CM закрыт пользователем; результат не подтверждён. Проверьте ПК перед повтором')
+                           for name in sorted(operation['pending']))
+            try:
+                atomic_json(self.data / 'reports' / (datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-interrupted-' + operation['id'] + '.json'), results)
+            except OSError as error:
+                messagebox.showwarning('Отчёт не сохранён', str(error), parent=self.window)
+        control = getattr(self, 'shutdown', None)
+        if control:
+            control.cancel()
         self.window.destroy()
 
 
