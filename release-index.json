@@ -1,0 +1,82 @@
+[
+  {
+    "version": "1.2",
+    "tag": "v1.2",
+    "commit": "6d21c08ce6bda754e217af29fc5d9b09ab31facf",
+    "archive": "CM-Astra-1.2.zip",
+    "sha256": "81f87dfcb12fd02c2635301de9b98ab0d6d99be226cfc14ec25c8ef848885167",
+    "bytes": 41287
+  },
+  {
+    "version": "1.3",
+    "tag": "v1.3",
+    "commit": "8bdf339ad936ea28e39b22e9efb0dd17d62099f0",
+    "archive": "CM-Astra-1.3.zip",
+    "sha256": "a5ecbd099ed9f2f89084b97d3db930ba2ea062ff91da7994e90b2bb99db6dcab",
+    "bytes": 44598
+  },
+  {
+    "version": "1.4",
+    "tag": "v1.4",
+    "commit": "24a366fb3e2abfa372ad46a6ca3b06be1bfbfa82",
+    "archive": "CM-Astra-1.4.zip",
+    "sha256": "66b3501b38ad10518f05c547fb517919575a93e392d49fd8e434ea484599cbbb",
+    "bytes": 52550
+  },
+  {
+    "version": "1.5",
+    "tag": "v1.5",
+    "commit": "94f4676b85ee68d41c7a494142ca64c183b6ebd1",
+    "archive": "CM-Astra-1.5.zip",
+    "sha256": "4ca48cef0cc1205906146b5c6713c617c47ea5918f95e9363d6258fcc0d99cdb",
+    "bytes": 55784
+  },
+  {
+    "version": "1.6",
+    "tag": "v1.6",
+    "commit": "61585f63c4b07b9bcf5a3897ce00b038bfc48f6d",
+    "archive": "CM-Astra-1.6.zip",
+    "sha256": "cdda57ee691adedf1ae9e23dd5569fb4b335e71c4744e0e93817f2409a3e2216",
+    "bytes": 53623
+  },
+  {
+    "version": "1.7",
+    "tag": "v1.7",
+    "commit": "b9e2408cf2e52a35b63780e8ecb11033dc143c8e",
+    "archive": "CM-Astra-1.7.zip",
+    "sha256": "e45ca46c04ac714d5535da956b4346500f478d3eb9389bc583fdbfe589c08656",
+    "bytes": 60164
+  },
+  {
+    "version": "1.8",
+    "tag": "v1.8",
+    "commit": "1d855fe9931334e64a3485ca4abdfa6245623fef",
+    "archive": "CM-Astra-1.8.zip",
+    "sha256": "c1a11b2971f889d1015b37e3417db49807255bdbad2d6ae3055bbe8b034b4836",
+    "bytes": 63346
+  },
+  {
+    "version": "1.9",
+    "tag": "v1.9",
+    "commit": "950789050d2cbff7daa962124891c97948a3a174",
+    "archive": "CM-Astra-1.9.zip",
+    "sha256": "61c05eda726aba930a85769259fe005a19dda5b1bfb54e2d89882aabb8dc05c7",
+    "bytes": 69366
+  },
+  {
+    "version": "2.0",
+    "tag": "v2.0",
+    "commit": "007493740966d7268a8f298e6c7606c3cd85f22c",
+    "archive": "CM-Astra-2.0.zip",
+    "sha256": "926e88863ad21cb92bf645ccfd3b78f69d1099c71d562d19846f62282d1359be",
+    "bytes": 80350
+  },
+  {
+    "version": "2.1",
+    "tag": "v2.1",
+    "commit": "d07550f6caf26350da583c65787021406a6ca9e9",
+    "archive": "CM-Astra-2.1.zip",
+    "sha256": "db23b249d6212a8ca5acf7daef209877ae2efabb41e13f41619c37e45b7a17d6",
+    "bytes": 85721
+  }
+]
