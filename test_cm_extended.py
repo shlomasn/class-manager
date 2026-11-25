@@ -1012,6 +1012,32 @@ class ConcurrentOperationsTests(unittest.TestCase):
             path.write_text('{"version":1,"theme":"dark"}')
             self.assertEqual(cm_ui.load_theme(path), 'dark')
 
+    def test_time_sync_is_parallel_and_stops_new_password_attempts(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            hosts = [core.Host('a209-' + str(n), '', '209') for n in range(1, 9)]
+            rows = [dict(name=h.name, ip='192.168.22.1') for h in hosts]
+            barrier = threading.Barrier(8, timeout=3)
+            def synchronize(host, pin, password, access_gate, progress, **kwargs):
+                access_gate.connect(host, pin, password)
+                progress(dict(phase='Установка времени учителя', elapsed=1, output=''))
+                barrier.wait()
+                return dict(name=host.name, action='time_sync', ok=True, message='Синхронизировано')
+            with patch.object(core, 'connect_verified', return_value=object()), patch.object(gui, 'synchronize_time', synchronize):
+                app.send({h.name:h for h in hosts}, rows, 'secret', 'time_sync', 0, [])
+            report = json.loads(next((app.data / 'reports').glob('*.json')).read_text())
+            self.assertEqual(len(report), 8)
+            self.assertTrue(all(r['ok'] for r in report), report)
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            with patch.object(core, 'connect_verified', side_effect=paramiko.AuthenticationException('wrong')) as connect:
+                app.send({h.name:h for h in hosts}, rows, 'secret', 'time_sync', 0, [])
+            connect.assert_called_once()
+            report = json.loads(next((app.data / 'reports').glob('*.json')).read_text())
+            self.assertFalse(any(r['ok'] for r in report))
+            self.assertEqual(sum(bool(r.get('stop')) for r in report), 1)
+
 
 class ManagedCommandTests(unittest.TestCase):
     def local_client(self):
@@ -1226,6 +1252,121 @@ class ManagedCommandTests(unittest.TestCase):
         outer = shlex.split(run.call_args.args[1])[-1]
         self.assertLess(outer.index('cd -- '), outer.index('sudo'))
         self.assertIn('/usr/bin/python3 -u -c ', outer)
+
+
+
+class TimeSynchronizationTests(unittest.TestCase):
+    host = core.Host('a209-01', '', '209')
+    pin = dict(ip='192.168.22.1')
+
+    def exchange(self, mode='success'):
+        clock = [0.0]
+        teacher = [1000.0]
+        token = 'test-token'
+        class Channel:
+            stdout = []
+            stderr = b''
+            ended = False
+            sent = []
+            command = ''
+            def exec_command(inner, command):
+                inner.command = command
+                if mode == 'sudo_failure':
+                    inner.stderr, inner.ended = b'1 incorrect password attempt', True
+                elif mode != 'no_ready':
+                    inner.stdout.append(('CM_TIME_READY:' + token + '\n').encode())
+            def sendall(inner, data):
+                inner.sent.append(data)
+                if not data.startswith(b'{'):
+                    return
+                message = json.loads(data)
+                if message['action'] == 'probe':
+                    clock[0] += 6 if mode == 'slow' else .2
+                    teacher[0] = 2000.0  # Simulate selection/login taking time before the fresh reading.
+                    inner.stdout.append(('CM_TIME_ACK:' + token + '\n').encode())
+                else:
+                    if mode == 'lost_after_set':
+                        inner.ended = True
+                        return
+                    detail = dict(before=500.0, target=message['epoch'], after=message['epoch'] + (10 if mode == 'bad_result' else 0),
+                                  before_local='before', after_local='after', timezone=['MSK'])
+                    inner.stdout.append(('CM_TIME_RESULT:' + token + ':' + json.dumps(detail) + '\n').encode())
+            def recv_ready(inner): return bool(inner.stdout)
+            def recv(inner, size): return inner.stdout.pop(0)
+            def recv_stderr_ready(inner): return bool(inner.stderr)
+            def recv_stderr(inner, size):
+                value, inner.stderr = inner.stderr, b''
+                return value
+            def exit_status_ready(inner): return inner.ended
+            def close(inner): inner.ended = True
+        channel = Channel()
+        client = types.SimpleNamespace(get_transport=lambda: types.SimpleNamespace(open_session=lambda **kw: channel), close=lambda: None)
+        def sleep(seconds): clock[0] += 1
+        source = lambda: teacher[0]
+        with patch.object(core, 'connect_verified', return_value=client), patch.object(core.uuid, 'uuid4', return_value=types.SimpleNamespace(hex=token)), patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(core.time, 'sleep', side_effect=sleep):
+            result = core.synchronize_time(self.host, self.pin, 'secret', clock_source=source, access_gate=core.TransferAccessGate())
+        return result, channel
+
+    def test_fresh_teacher_time_and_rtt_compensation_after_authentication(self):
+        result, channel = self.exchange()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['teacher_epoch'], 2000.0)
+        self.assertAlmostEqual(result['target_epoch'], 2000.1)
+        self.assertEqual(result['round_trip_ms'], 200.0)
+        self.assertNotIn('secret', channel.command)
+        self.assertEqual(channel.sent[0], b'secret\n')
+        messages = [json.loads(value) for value in channel.sent if value.startswith(b'{')]
+        self.assertEqual([m['action'] for m in messages], ['probe', 'set'])
+        self.assertAlmostEqual(messages[1]['epoch'], 2000.1)
+        self.assertNotIn('secret', json.dumps(result))
+
+    def test_slow_link_never_sends_clock_update(self):
+        result, channel = self.exchange('slow')
+        self.assertFalse(result['ok'])
+        self.assertFalse(result['sent'])
+        self.assertFalse(any(b'"set"' in data for data in channel.sent))
+
+    def test_lost_confirmation_and_bad_result_are_not_success(self):
+        for mode in ('lost_after_set', 'bad_result'):
+            result, channel = self.exchange(mode)
+            self.assertFalse(result['ok'], result)
+            self.assertTrue(result['sent'])
+            self.assertIn('не подтверждён', result['message'])
+
+    def test_sudo_error_and_timeout_never_set_the_clock(self):
+        result, channel = self.exchange('sudo_failure')
+        self.assertTrue(result['stop'])
+        self.assertFalse(result['sent'])
+        self.assertEqual(len(channel.sent), 1)
+        result, channel = self.exchange('no_ready')
+        self.assertFalse(result['ok'])
+        self.assertFalse(result['sent'])
+
+    def test_remote_script_protocol_with_clock_set_stub_never_changes_local_clock(self):
+        import subprocess, sys
+        token = 'local-test'
+        prefix = '''import time
+_clock = [500.0]
+_sets = []
+def fake_set(clock_id, epoch):
+    _sets.append(epoch)
+    _clock[0] = epoch
+time.clock_settime = fake_set
+time.time = lambda: _clock[0]
+'''
+        script = prefix + core.time_sync_script(token) + '\nassert _sets == [2000.5]\n'
+        payload = '\n'.join(json.dumps(x) for x in [dict(token=token, action='probe'), dict(token=token, action='set', epoch=2000.5)]) + '\n'
+        result = subprocess.run([sys.executable, '-c', script], input=payload, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[:2], ['CM_TIME_READY:' + token, 'CM_TIME_ACK:' + token])
+        detail = json.loads(lines[2].split('CM_TIME_RESULT:' + token + ':', 1)[1])
+        self.assertEqual(detail['before'], 500.0)
+        self.assertEqual(detail['after'], 2000.5)
+        bad = payload.replace('"epoch": 2000.5', '"epoch": NaN')
+        result = subprocess.run([sys.executable, '-c', prefix + core.time_sync_script(token)], input=bad, capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('CM_TIME_RESULT:', result.stdout)
 
 
 if __name__ == '__main__':

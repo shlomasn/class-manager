@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time
 import credential_store
 import cm_ui
 
@@ -99,7 +99,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.0 — управление школьными компьютерами')
+        window.title('CM Astra 2.1 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -172,7 +172,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.0 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.1 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -186,6 +186,9 @@ class Manager:
         check = ttk.Button(header, text='Проверить связь', command=lambda: self.begin('scan'))
         check.grid(row=0, column=1, sticky='e')
         self.controls.append(check)
+        self.time_sync_button = ttk.Button(header, text='Синхронизировать время', command=self.sync_time_dialog)
+        self.time_sync_button.grid(row=0, column=2, sticky='e', padx=(8, 0))
+        self.controls.append(self.time_sync_button)
         self.overview = tk.StringVar(value='Компьютеры учеников')
         ttk.Label(main, textvariable=self.overview, style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 12))
 
@@ -671,6 +674,9 @@ class Manager:
             return
         self.begin('distribute', dict(files=list(files), batch=batch, destination=destination))
 
+    def sync_time_dialog(self):
+        self.begin('time_sync')
+
     def cancel_distribution(self):
         targets = []
         for host in self.visible():
@@ -1035,6 +1041,8 @@ class Manager:
             operation['controls'] = {host.name: OperationControl(parent=self.shutdown, reason='Раздача отменена пользователем') for host in hosts}
         elif action == 'command':
             operation['controls'] = {host.name: CommandControl(parent=self.shutdown) for host in hosts}
+        elif action == 'time_sync':
+            operation['controls'] = {host.name: OperationControl(parent=self.shutdown) for host in hosts}
         self.preparing_operation = operation['id']
         self.set_busy(True)
         self.summary.set('Проверка SSH без пароля…')
@@ -1128,8 +1136,15 @@ class Manager:
                 self.trusted[row['name']] = {k: row[k] for k in ('type', 'key', 'fingerprint', 'name')}
             atomic_json(self.trust_file, self.trusted)
         names = ', '.join(row['name'] for row in permitted)
-        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на'}[action]
+        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на', 'time_sync': 'Синхронизировать время на'}[action]
         text = verb + ' ' + str(len(permitted)) + (' компьютерах?' if action == 'cancel' else ' компьютеров?') + '\n\n' + names
+        if action == 'time_sync':
+            now = datetime.datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z (UTC%z)')
+            text = 'Синхронизировать время на выбранных ПК (' + str(len(permitted)) + ')?\n\n' + names
+            text += ('\n\nИсточник — этот компьютер учителя. Сейчас: ' + now
+                     + '\nПеред установкой каждый ПК получит свежее время учителя с учётом задержки связи.'
+                       '\nЧасовой пояс, аппаратные часы и настройки NTP не меняются.'
+                       '\nПотребуются права sudo. Убедитесь, что часы учителя правильные: время ученических ПК может измениться скачком.')
         if action in ('off', 'reboot'):
             text += ('\n\nНЕМЕДЛЕННО, без возможности отмены после выполнения.' if minutes == 0 else '\n\nЧерез ' + str(minutes) + ' мин. после отправки каждому ПК.')
             text += ' Несохранённые данные будут потеряны.'
@@ -1305,6 +1320,29 @@ class Manager:
             results = {pending[future]: future.result() for future in as_completed(pending)}
         return [results[pin['name']] for pin in rows]
 
+    def send_time_sync(self, host_map, rows, password, events, control=None, host_controls=None):
+        gate = TransferAccessGate(control)
+        host_controls = host_controls or {}
+        def worker(pin):
+            name = pin['name']
+            worker_control = host_controls.get(name, control)
+            try:
+                result = synchronize_time(host_map[name], pin, password,
+                                          progress=lambda value: events.put(('command_progress', dict(value, name=name))),
+                                          control=worker_control, access_gate=gate)
+            except Exception as error:
+                result = dict(name=name, ip=pin['ip'], action='time_sync', ok=False, message=str(error).replace(password, '[СКРЫТО]'))
+            if result.get('stop'):
+                gate.stopped.set()
+            events.put(('result', result))
+            return result
+        if not rows:
+            return []
+        with ThreadPoolExecutor(max_workers=len(rows)) as pool:
+            pending = {pool.submit(worker, pin): pin['name'] for pin in rows}
+            results = {pending[future]: future.result() for future in as_completed(pending)}
+        return [results[pin['name']] for pin in rows]
+
     def send(self, host_map, rows, password, action, minutes, initial_results, job=None, events=None, control=None, host_controls=None):
         events = events or self.events
         options = dict(control=control) if control else {}
@@ -1314,7 +1352,9 @@ class Manager:
                 results.extend(self.distribute_files(host_map, rows, password, job, events, control, host_controls))
             if action == 'command':
                 results.extend(self.send_commands(host_map, rows, password, job, events, control, host_controls))
-            for index, pin in enumerate([] if action in ('distribute', 'command') else rows):
+            if action == 'time_sync':
+                results.extend(self.send_time_sync(host_map, rows, password, events, control, host_controls))
+            for index, pin in enumerate([] if action in ('distribute', 'command', 'time_sync') else rows):
                 if control:
                     control.check()
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
@@ -1491,7 +1531,7 @@ class Manager:
         active = getattr(getattr(self, 'operations', None), 'active', {})
         if active or self.busy:
             titles = {'distribute': 'Раздача файлов', 'command': 'Выполнение команды',
-                      'off': 'Выключение', 'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи'}
+                      'off': 'Выключение', 'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи', 'time_sync': 'Синхронизация времени'}
             details = []
             for operation in active.values():
                 names = sorted(operation['pending'])

@@ -953,3 +953,138 @@ def prepare_transfer(path, progress=None):
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise RuntimeError('Исходный файл изменился во время подготовки; отправка не начата')
     return dict(path=str(source.resolve()), size=before.st_size, mtime_ns=before.st_mtime_ns, sha256=digest)
+
+
+def time_sync_script(token):
+    """Remote half of the clock exchange. No NTP, timezone or RTC configuration writes."""
+    program = r'''import datetime, json, math, sys, time
+token = TOKEN
+if not hasattr(time, 'clock_settime') or not hasattr(time, 'CLOCK_REALTIME'):
+    raise RuntimeError('Установка системного времени не поддерживается')
+def read():
+    line = sys.stdin.buffer.readline(4097)
+    if not line or len(line) > 4096:
+        raise RuntimeError('Связь с учителем потеряна до установки времени')
+    return json.loads(line)
+print('CM_TIME_READY:' + token, flush=True)
+probe = read()
+if probe != dict(token=token, action='probe'):
+    raise RuntimeError('Некорректный запрос проверки задержки')
+print('CM_TIME_ACK:' + token, flush=True)
+request = read()
+if request.get('token') != token or request.get('action') != 'set':
+    raise RuntimeError('Некорректный запрос синхронизации')
+target = request.get('epoch')
+if type(target) not in (int, float) or not math.isfinite(target) or not 0 < target < 253402300799:
+    raise RuntimeError('Некорректное время учителя')
+before = time.time()
+time.clock_settime(time.CLOCK_REALTIME, target)
+after = time.time()
+if abs(after - target) > 1:
+    raise RuntimeError('Новое время не подтверждено после установки')
+def display(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).astimezone().isoformat(timespec='seconds')
+result = dict(before=before, after=after, target=target, before_local=display(before),
+              after_local=display(after), timezone=time.tzname, correction_seconds=target-before)
+print('CM_TIME_RESULT:' + token + ':' + json.dumps(result), flush=True)
+'''
+    return program.replace('TOKEN', repr(token), 1)
+
+
+def synchronize_time(host, pin, password, progress=None, control=None, access_gate=None, clock_source=None):
+    """Send a fresh teacher timestamp only after verified SSH, sudo and an RTT probe."""
+    import math
+    result = dict(name=host.name, ip=pin['ip'], action='time_sync', ok=False, source='teacher', sent=False)
+    client = channel = None
+    started = time.monotonic()
+    deadline = started + 60
+    buffer = bytearray()
+    diagnostics = bytearray()
+    def notify(phase):
+        if control:
+            control.check()
+        if progress:
+            progress(dict(phase=phase, elapsed=int(time.monotonic()-started), output=''))
+    def line(prefix):
+        while time.monotonic() < deadline:
+            if control:
+                control.check()
+            while channel.recv_ready():
+                buffer.extend(channel.recv(8192))
+                if len(buffer) > 16384:
+                    raise RuntimeError('Слишком большой ответ синхронизации')
+            while channel.recv_stderr_ready():
+                diagnostics.extend(channel.recv_stderr(8192))
+                if len(diagnostics) > 16384:
+                    raise RuntimeError('Слишком большой ответ синхронизации')
+            while b'\n' in buffer:
+                value, remainder = buffer.split(b'\n', 1)
+                buffer[:] = remainder
+                value = value.decode('utf-8', errors='replace').rstrip('\r')
+                if value.startswith(prefix):
+                    return value[len(prefix):]
+            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                raise RuntimeError('Синхронизация не подтверждена: ' + diagnostics.decode('utf-8', errors='replace').strip())
+            time.sleep(.02)
+        raise RuntimeError('Время ожидания синхронизации истекло; результат не подтверждён')
+    def send(data):
+        if control:
+            control.check()
+        channel.sendall((json.dumps(data) + '\n').encode('utf-8'))
+    try:
+        notify('Подключение и проверка имени/ОС')
+        options = dict(control=control) if control else {}
+        client = access_gate.connect(host, pin, password, **options) if access_gate else connect_verified(host, pin, password, **options)
+        if access_gate:
+            access_gate.check()
+        token = uuid.uuid4().hex
+        notify('Проверка прав установки времени')
+        channel = client.get_transport().open_session(timeout=8)
+        channel.exec_command("LC_ALL=C sudo -k -S -p '' /usr/bin/python3 -u -c " + shlex.quote(time_sync_script(token)))
+        channel.sendall((password + '\n').encode('utf-8'))
+        line('CM_TIME_READY:' + token)
+        if access_gate:
+            access_gate.check()
+        notify('Измерение задержки связи')
+        probe_started = time.monotonic()
+        send(dict(token=token, action='probe'))
+        line('CM_TIME_ACK:' + token)
+        rtt = time.monotonic()-probe_started
+        if rtt > 5:
+            raise RuntimeError('Слишком большая задержка связи; время не изменено. Повторите после проверки сети')
+        if access_gate:
+            access_gate.check()
+        notify('Установка времени учителя')
+        # Compute at the last possible moment, not during selection/confirmation/SSH login.
+        teacher = (clock_source or time.time)()
+        if type(teacher) not in (int, float) or not math.isfinite(teacher) or not 0 < teacher < 253402300799:
+            raise ValueError('Проверьте дату и время компьютера учителя')
+        target = teacher + rtt/2
+        result.update(sent=True, teacher_epoch=teacher, target_epoch=target, round_trip_ms=round(rtt*1000, 2))
+        send(dict(token=token, action='set', epoch=target))
+        notify('Проверка установленного времени')
+        detail = json.loads(line('CM_TIME_RESULT:' + token + ':'))
+        if not all(type(detail.get(key)) in (int, float) and math.isfinite(detail[key]) for key in ('before', 'after', 'target')) or abs(detail['target']-target) > .001 or abs(detail['after']-target) > 1:
+            raise RuntimeError('Ответ не подтверждает установленное время')
+        result.update(ok=True, time=detail, message='Время синхронизировано с компьютером учителя',
+                      output='Было: ' + detail['before_local'] + '\nСтало: ' + detail['after_local']
+                             + '\nПоправка, секунд: ' + str(round(detail['target']-detail['before'], 3))
+                             + '\nЗадержка обмена, мс: ' + str(result['round_trip_ms'])
+                             + '\nЧасовой пояс и настройки NTP не изменялись.')
+    except Exception as error:
+        operation_error(result, error, password)
+        text = str(error).lower()
+        if 'incorrect password' in text or 'authentication failure' in text:
+            result.update(stop=True, message='Ошибка пароля sudo; дальнейшие попытки остановлены')
+        elif result['sent']:
+            result['message'] = 'Запрос установки времени отправлен; результат не подтверждён. Проверьте ПК перед повтором. ' + result.get('message', '')
+    finally:
+        if result.get('stop') and access_gate:
+            access_gate.stopped.set()
+        if channel:
+            channel.close()
+        if client:
+            client.close()
+            if control:
+                control.discard(client)
+    return result

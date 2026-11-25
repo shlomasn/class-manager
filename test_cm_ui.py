@@ -134,6 +134,22 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(all(text.cget('background') == cm_ui.PALETTES['dark']['surface'] for text in texts))
         dialog.destroy()
 
+    def test_time_sync_button_and_confirmation_require_selected_hosts(self):
+        app = self.app
+        with patch.object(app, 'begin') as begin:
+            app.time_sync_button.invoke()
+        begin.assert_called_once_with('time_sync')
+        host = app.hosts[0]
+        operation = app.operations.start('time_sync', [host], {})
+        pin = dict(name=host.name, ip='192.168.22.1', ok=True, type='ssh-ed25519', key='key')
+        with patch.object(gui, 'classify_key', return_value='trusted'), patch.object(gui.messagebox, 'askokcancel', return_value=False) as confirm, patch.object(app, 'get_password') as password, patch.object(gui.threading, 'Thread') as thread:
+            app.discovered([host], 'time_sync', 0, [pin], operation_id=operation['id'])
+        self.assertIn('компьютер учителя', confirm.call_args.args[1])
+        self.assertIn('Часовой пояс', confirm.call_args.args[1])
+        password.assert_not_called()
+        thread.assert_not_called()
+        self.assertNotIn(operation['id'], app.operations.active)
+
     def test_all_inventory_password_and_power_actions_stay_available_in_menus(self):
         labels = {menu.entrycget(index, 'label'): (menu, index, inventory) for menu, index, inventory in self.app.menu_controls}
         expected = ['Добавить ПК…', 'Изменить выбранную строку…', 'Удалить отмеченные ПК…',
