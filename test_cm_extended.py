@@ -295,7 +295,8 @@ class UploadTests(unittest.TestCase):
             with patch.object(core, 'connect_verified', return_value=self.client), patch.object(core, 'run', run):
                 result = core.download_from_teacher(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'),
                                                     'secret', str(self.source), progress=events.append,
-                                                    on_conflict=(lambda path: answer) if answer is not None else None)
+                                                    on_conflict=(lambda path: answer) if answer is not None else None,
+                                                    access_gate=core.DownloadAccessGate(), prepared=core.prepare_download(self.source))
             return result, events, transport
         result, events, transport = download()
         self.assertTrue(result['ok'], result)
@@ -342,6 +343,15 @@ class UploadTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_changed_prepared_source_never_connects(self):
+        prepared = core.prepare_download(self.source)
+        self.source.write_bytes(b'changed after preparation')
+        with patch.object(core, 'connect_verified') as connect:
+            result = core.download_from_teacher(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', str(self.source), prepared=prepared, access_gate=core.DownloadAccessGate())
+        self.assertFalse(result['ok'])
+        connect.assert_not_called()
+        self.assertIn('после подготовки', result['message'])
 
     def test_download_forwarding_rejected_no_file_written(self):
         transport = types.SimpleNamespace(request_port_forward=lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('denied')))
@@ -421,6 +431,10 @@ class DispatchTests(unittest.TestCase):
             for action, function, job in [('upload', 'transfer_files', dict(files=['x'], batch='test')),
                                           ('command', 'execute_command', dict(script='id', sudo=False, timeout=60)),
                                           ('download', 'download_from_teacher', dict(files=['x'], destination=core.DEFAULT_INBOX))]:
+                if action == 'download':
+                    path = Path(directory) / 'teacher.bin'
+                    path.write_bytes(b'file')
+                    job['files'] = [str(path)]
                 app = gui.Manager.__new__(gui.Manager)
                 app.data = Path(directory)
                 import queue
@@ -450,20 +464,101 @@ class DispatchTests(unittest.TestCase):
 
     def test_password_failure_stops_remaining_downloads(self):
         import queue
+        import threading
         with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'teacher.bin'
+            path.write_bytes(b'data')
             app = gui.Manager.__new__(gui.Manager)
             app.data, app.events = Path(directory), queue.Queue()
-            rows = [dict(name='a209-01', ip='192.168.22.1'), dict(name='a209-02', ip='192.168.22.2')]
-            failed = dict(rows[0], ok=False, message='Ошибка доступа', stop=True, action='download')
-            with patch.object(gui, 'download_from_teacher', return_value=failed) as download:
-                app.send({r['name']: core.Host(r['name'], '', '209') for r in rows}, rows, 'secret', 'download', 0, [], dict(files=['x'], destination=core.DEFAULT_INBOX))
-            download.assert_called_once()
+            rows = [dict(name='a209-' + str(n), ip='192.168.22.' + str(n)) for n in range(1, 9)]
+            attempted = []
+            denied = threading.Event()
+            def connect(host, pin, password):
+                attempted.append(host.name)
+                if len(attempted) == 2:
+                    denied.set()
+                    raise paramiko.AuthenticationException('bad password')
+                return object()
+            def download(host, pin, password, path, access_gate, **kwargs):
+                result = dict(name=host.name, ip=pin['ip'], action='download', ok=False)
+                try:
+                    access_gate.connect(host, pin, password)
+                    self.assertTrue(denied.wait(3), 'Other hosts were held until first download finished')
+                    result.update(ok=True, message='Already started download completed')
+                except core.DownloadStopped as error:
+                    result.update(cancelled=True, message=str(error))
+                except Exception as error:
+                    core.operation_error(result, error, password)
+                return result
+            with patch.object(core, 'connect_verified', connect), patch.object(gui, 'download_from_teacher', download):
+                app.send({r['name']: core.Host(r['name'], '', '209') for r in rows}, rows, 'secret', 'download', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX))
+            self.assertEqual(len(attempted), 2)
             events = []
             while not app.events.empty():
                 events.append(app.events.get())
             results = [value for kind, value in events if kind == 'result']
-            self.assertEqual(len(results), 2)
-            self.assertIn('Пропущен', results[1]['message'])
+            self.assertEqual(len(results), 8)
+            self.assertEqual(sum(r.get('stop', False) for r in results), 1)
+            self.assertEqual(sum(r.get('cancelled', False) for r in results), 6)
+            self.assertEqual(sum(r['ok'] for r in results), 1)
+            self.assertEqual(len([v for k, v in events if k == 'finished']), 1)
+
+    def test_all_eight_downloads_start_before_any_one_finishes(self):
+        import queue
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'teacher.bin'
+            path.write_bytes(b'file contents')
+            app = gui.Manager.__new__(gui.Manager)
+            app.data, app.events = Path(directory), queue.Queue()
+            rows = [dict(name='a209-' + str(n), ip='192.168.22.' + str(n)) for n in range(1, 9)]
+            barrier = threading.Barrier(len(rows), timeout=3)
+            prepared_ids = []
+            def download(host, pin, password, path, progress, access_gate, prepared, **kwargs):
+                access_gate.connect(host, pin, password)
+                prepared_ids.append(id(prepared))
+                progress(dict(phase='Скачивание с учительского ПК', file='teacher.bin', done=4, total=13, destination='/home/user/Desktops/Desktop1/CM-Inbox'))
+                barrier.wait()  # Sequential or six-worker dispatch cannot pass this barrier.
+                return dict(name=host.name, ip=pin['ip'], action='download', ok=True, message='done')
+            with patch.object(core, 'connect_verified', return_value=object()), patch.object(gui, 'download_from_teacher', download), patch.object(gui, 'prepare_download', wraps=core.prepare_download) as prepare:
+                app.send({r['name']: core.Host(r['name'], '', '209') for r in rows}, rows, 'secret', 'download', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX))
+            prepare.assert_called_once()
+            self.assertEqual(len(prepared_ids), 8)
+            self.assertEqual(len(set(prepared_ids)), 1)
+            events = []
+            while not app.events.empty():
+                events.append(app.events.get())
+            results = [v for k, v in events if k == 'result']
+            self.assertEqual(len(results), 8)
+            self.assertTrue(all(r['ok'] for r in results), results)
+            progress = [v for k, v in events if k == 'download_progress']
+            self.assertEqual({v['name'] for v in progress}, {r['name'] for r in rows})
+            finished = [v for k, v in events if k == 'finished']
+            self.assertEqual(len(finished), 1)
+            self.assertEqual([r['name'] for r in finished[0][0]], [r['name'] for r in rows])
+            self.assertEqual(json.loads(Path(finished[0][1]).read_text()), finished[0][0])
+
+    def test_progress_is_separate_for_each_pc_and_final_status_is_preserved(self):
+        import queue
+        app = gui.Manager.__new__(gui.Manager)
+        app.events = queue.Queue()
+        app.statuses = {}
+        app.download_state = {name: dict(percent=0, complete=False) for name in ['a209-01', 'a209-02']}
+        displayed = {}
+        app.table = types.SimpleNamespace(exists=lambda name: True, set=lambda name, column, value: displayed.update({name: value}))
+        app.progress = types.SimpleNamespace(stop=lambda: None, configure=lambda **kwargs: None)
+        app.summary = types.SimpleNamespace(set=lambda value: None)
+        app.window = types.SimpleNamespace(after=lambda *args: None)
+        app.refresh = lambda: displayed.update({name: status[0] for name, status in app.statuses.items()})
+        for name, done in [('a209-01', 50), ('a209-02', 25)]:
+            app.events.put(('download_progress', dict(name=name, done=done, total=100, phase='Скачивание')))
+        app.events.put(('result', dict(name='a209-01', action='download', ok=True, message='Файл скачан и проверен')))
+        app.events.put(('download_progress', dict(name='a209-01', done=80, total=100, phase='Скачивание')))
+        app.poll()
+        self.assertEqual(displayed['a209-01'], 'Файл скачан и проверен')
+        self.assertIn('25%', displayed['a209-02'])
+        self.assertTrue(app.download_state['a209-01']['complete'])
+        self.assertFalse(app.download_state['a209-02']['complete'])
 
     def test_forwarded_http_channel_serves_only_selected_token(self):
         class Channel:

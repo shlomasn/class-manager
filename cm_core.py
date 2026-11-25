@@ -693,7 +693,45 @@ finally:
     return script.replace('CONFIG', repr(json.dumps(config, ensure_ascii=False)), 1)
 
 
-def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, progress=None, on_conflict=None):
+class DownloadStopped(RuntimeError):
+    pass
+
+
+class DownloadAccessGate:
+    """Serialize password attempts only; file downloads run concurrently."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+
+    def check(self):
+        if self.stopped.is_set():
+            raise DownloadStopped('Пропущен после ошибки доступа; повторных попыток нет')
+
+    def connect(self, host, pin, password):
+        import paramiko
+        with self.lock:
+            self.check()
+            try:
+                return connect_verified(host, pin, password)
+            except paramiko.AuthenticationException:
+                self.stopped.set()
+                raise
+
+
+def prepare_download(path, progress=None):
+    source = Path(path)
+    if not source.is_file():
+        raise ValueError('Выберите существующий файл')
+    before = source.stat()
+    with source.open('rb') as stream:
+        digest = _digest_stream(stream, progress)
+    after = source.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError('Исходный файл изменился во время подготовки; отправка не начата')
+    return dict(path=str(source.resolve()), size=before.st_size, mtime_ns=before.st_mtime_ns, sha256=digest)
+
+
+def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, progress=None, on_conflict=None, access_gate=None, prepared=None):
     import posixpath
     import stat
     source = Path(path)
@@ -705,16 +743,18 @@ def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, 
     port = None
     done = 0
     before = source.stat()
-    total = before.st_size * 2
+    total = before.st_size if prepared else before.st_size * 2
     def notify(phase, delta=0):
         nonlocal done
         done += delta
         if progress:
             progress(dict(phase=phase, file=source.name, done=done, total=total,
-                          destination=result['destination'], description='подготовка + скачивание; SHA-256 на ПК'))
+                          destination=result['destination'], description=('скачивание; SHA-256 на ПК' if prepared else 'подготовка + скачивание; SHA-256 на ПК')))
     notify('Подключение и проверка имени/ОС')
     try:
-        client = connect_verified(host, pin, password)
+        if prepared and (str(source.resolve()), before.st_size, before.st_mtime_ns) != (prepared['path'], prepared['size'], prepared['mtime_ns']):
+            raise RuntimeError('Исходный файл изменился после подготовки; скачивание не начато')
+        client = access_gate.connect(host, pin, password) if access_gate else connect_verified(host, pin, password)
         sftp = client.open_sftp()
         sftp.get_channel().settimeout(60)
         home = sftp.normalize('.')
@@ -738,9 +778,14 @@ def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, 
                 result.update(ok=True, message='Файл пропущен без перезаписи', skipped=[target])
                 return result
             overwrite = True
-        notify('Подготовка SHA-256')
-        with source.open('rb') as stream:
-            digest = _digest_stream(stream, lambda n: notify('Подготовка SHA-256', n))
+        if prepared:
+            digest = prepared['sha256']
+        else:
+            notify('Подготовка SHA-256')
+            with source.open('rb') as stream:
+                digest = _digest_stream(stream, lambda n: notify('Подготовка SHA-256', n))
+        if access_gate:
+            access_gate.check()
         token = uuid.uuid4().hex
         transport = client.get_transport()
         def handler(channel, origin, server):
@@ -754,6 +799,8 @@ def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, 
         script = download_script('http://127.0.0.1:' + str(port) + '/' + token,
                                  folder, source.name, digest, before.st_size, overwrite)
         notify('Ожидание скачивания и проверки SHA-256')
+        if access_gate:
+            access_gate.check()
         code, output = run(client, '/usr/bin/python3 -c ' + shlex.quote(script), timeout=1800)
         if code != 0:
             raise RuntimeError('Скачивание не подтверждено; проверьте ПК перед повтором. ' + output)
@@ -766,6 +813,8 @@ def download_from_teacher(host, pin, password, path, destination=DEFAULT_INBOX, 
             raise RuntimeError('Исходный файл изменился во время скачивания; проверьте результат')
         notify('Готово')
         result.update(ok=True, message='Файл скачан и проверен SHA-256', output=target)
+    except DownloadStopped as error:
+        result.update(message=str(error), cancelled=True)
     except Exception as error:
         operation_error(result, error, password)
     finally:

@@ -1,5 +1,5 @@
 """Class Manager for a Windows teacher computer controlling Astra over SSH."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import json
 import os
@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, download_from_teacher
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, download_from_teacher, prepare_download, DownloadAccessGate
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -48,7 +48,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.4 — управление школьными компьютерами')
+        window.title('CM Astra 1.5 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -759,7 +759,7 @@ class Manager:
         if action == 'command':
             text += '\n\n' + ('ПРАВА ROOT (sudo)' if self.job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + self.job['cwd'] + '\n' + self.job['script'][:2000]
         if action == 'download':
-            text += '\nВыбранные ПК начнут скачивать указанный файл учителя. После скачивания проверяется SHA-256.'
+            text += '\nВыбранные ПК будут скачивать файл одновременно, не ожидая завершения друг друга. После скачивания проверяется SHA-256.'
         if action == 'command' and self.job.get('targets'):
             text += '\n\nПроверка SHA-256 и запуск файлов:\n' + '\n'.join(row['name'] + ': ' + self.job['targets'][row['name']]['expected_file']['path'] for row in permitted)
         if initial_results:
@@ -809,17 +809,76 @@ class Manager:
         self.window.wait_window(dialog)
         return result[0]
 
+    def send_downloads(self, host_map, rows, password, job):
+        # Hash a large teacher file once, before launching independent downloads.
+        total = Path(job['files'][0]).stat().st_size
+        done = 0
+        last_prepare = 0
+        def preparation(count):
+            nonlocal done, last_prepare
+            done += count
+            now = time.monotonic()
+            if now - last_prepare >= .2:
+                self.events.put(('scan_progress', 'Подготовка файла для всех ПК: SHA-256 ' + str(round(done * 100 / total) if total else 100) + '%'))
+                last_prepare = now
+        self.events.put(('scan_progress', 'Подготовка файла для одновременного скачивания…'))
+        prepared = prepare_download(job['files'][0], progress=preparation)
+        gate = DownloadAccessGate()
+        self.events.put(('download_started', [pin['name'] for pin in rows]))
+        def worker(pin):
+            name = pin['name']
+            last_update = 0
+            last_phase = None
+            def progress(value):
+                nonlocal last_update, last_phase
+                now = time.monotonic()
+                if value['phase'] != last_phase or now - last_update >= .2:
+                    self.events.put(('download_progress', dict(value, name=name)))
+                    last_update, last_phase = now, value['phase']
+            def on_conflict(path):
+                answer = queue.Queue(maxsize=1)
+                self.events.put(('overwrite', (name, path, answer)))
+                return answer.get()
+            try:
+                result = download_from_teacher(host_map[name], pin, password, job['files'][0],
+                                               destination=job['destination'], progress=progress,
+                                               on_conflict=on_conflict, access_gate=gate, prepared=prepared)
+            except Exception as error:
+                result = dict(name=name, ip=pin['ip'], action='download', ok=False,
+                              message=str(error).replace(password, '[СКРЫТО]'))
+            result['requested_destination'] = job['destination']
+            self.events.put(('result', result))
+            return result
+        if not rows:
+            return []
+        # Every selected PC gets its own worker; no worker waits for another file.
+        with ThreadPoolExecutor(max_workers=len(rows)) as pool:
+            pending = {pool.submit(worker, pin): pin['name'] for pin in rows}
+            results = {pending[future]: future.result() for future in as_completed(pending)}
+        return [results[pin['name']] for pin in rows]
+
+    def update_download_summary(self):
+        state = self.download_state
+        complete = sum(item['complete'] for item in state.values())
+        percent = sum(item['percent'] for item in state.values()) / len(state) if state else 100
+        self.progress.stop()
+        self.progress.configure(mode='determinate', maximum=100, value=percent)
+        self.summary.set('Параллельное скачивание: завершено ПК ' + str(complete) + '/' + str(len(state))
+                         + '. Прогресс каждого ПК — в столбце «Состояние / результат».')
+
     def send(self, host_map, rows, password, action, minutes, initial_results, job=None):
         results = list(initial_results)
         try:
-            for index, pin in enumerate(rows):
+            if action == 'download':
+                results.extend(self.send_downloads(host_map, rows, password, job))
+            for index, pin in enumerate([] if action == 'download' else rows):
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
                 self.events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
                 def on_conflict(path):
                     answer = queue.Queue(maxsize=1)
                     self.events.put(('overwrite', (pin['name'], path, answer)))
                     return answer.get()
-                if action in ('upload', 'download'):
+                if action == 'upload':
                     last_update = 0
                     last_phase = None
                     def progress(value):
@@ -829,12 +888,8 @@ class Manager:
                         if stage != last_phase or now - last_update >= 0.1:
                             self.events.put(('upload_progress', dict(value, label=label)))
                             last_update, last_phase = now, stage
-                    if action == 'upload':
-                        result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'],
-                                                destination=job.get('destination'), progress=progress, on_conflict=on_conflict)
-                    else:
-                        result = download_from_teacher(host_map[pin['name']], pin, password, job['files'][0],
-                                                       destination=job['destination'], progress=progress, on_conflict=on_conflict)
+                    result = transfer_files(host_map[pin['name']], pin, password, job['files'], job['batch'],
+                                            destination=job.get('destination'), progress=progress, on_conflict=on_conflict)
                 elif action == 'command':
                     target = job.get('targets', {}).get(pin['name'], {})
                     self.events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + target.get('cwd', job.get('cwd', '~'))))
@@ -867,6 +922,9 @@ class Manager:
                 if kind == 'discovered':
                     self.discovered(*value)
                 elif kind == 'result':
+                    if value.get('action') == 'download' and value['name'] in getattr(self, 'download_state', {}):
+                        self.download_state[value['name']] = dict(percent=100, complete=True)
+                        self.update_download_summary()
                     if value.get('action') in ('upload', 'download') and value.get('files'):
                         self.last_upload_directory = value['requested_destination']
                     self.statuses[value['name']] = (value['message'], not value['ok'])
@@ -877,6 +935,23 @@ class Manager:
                     good = sum(r['ok'] for r in results)
                     self.set_busy(False)
                     self.summary.set('Готово: успешно ' + str(good) + ', ошибок/пропусков ' + str(len(results) - good) + '. Отчёт: ' + report)
+                elif kind == 'download_started':
+                    self.download_state = {name: dict(percent=0, complete=False) for name in value}
+                    for name in value:
+                        self.statuses[name] = ('Ожидает подключения для скачивания', False)
+                    self.refresh()
+                    self.update_download_summary()
+                elif kind == 'download_progress':
+                    name = value['name']
+                    state = self.download_state.get(name)
+                    if state is not None and not state['complete']:
+                        percent = min(99, value['done'] * 100 / value['total']) if value['total'] else 0
+                        state['percent'] = percent
+                        label = value['phase'] + ' • ' + str(int(percent)) + '%'
+                        self.statuses[name] = (label, False)
+                        if self.table.exists(name):
+                            self.table.set(name, 'status', label)
+                        self.update_download_summary()
                 elif kind == 'range_found':
                     self.range_found(value)
                 elif kind == 'range_inspected':
