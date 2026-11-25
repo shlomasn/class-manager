@@ -1,14 +1,14 @@
-CM Astra 1.7; 25.11.2026
+CM Astra 1.8; 25.11.2026
 ...................................
 ----------------------------------------------------------------------
-Ran 35 tests in 0.007s
+Ran 35 tests in 0.009s
 
 OK
 
-...........................................
+...................................................
 ----------------------------------------------------------------------
-Ran 43 tests in 0.305s
+Ran 51 tests in 0.537s
 
 OK
 
-Tests use fake SSH/SFTP and platform vault APIs. Independent concurrent operations, per-host release, exit confirmation/cancellation, parallel multi-file distribution and live command output/heartbeat/redaction are covered; local Bash validates directory quoting. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.
+Tests use fake SSH/SFTP and platform vault APIs. Selective per-host cancellation, parallel command dispatch, independent concurrent operations, per-host release, exit confirmation/cancellation, parallel multi-file distribution and live command output/heartbeat/redaction are covered; local Bash validates directory quoting. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.

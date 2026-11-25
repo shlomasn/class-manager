@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled
 import credential_store
 
 ROOT = Path(__file__).resolve().parent
@@ -96,7 +96,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.7 — управление школьными компьютерами')
+        window.title('CM Astra 1.8 — управление школьными компьютерами')
         window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -162,6 +162,7 @@ class Manager:
         remote = ttk.Frame(outer)
         remote.pack(fill='x', pady=(10, 0))
         self.button(remote, 'Раздать файлы', self.distribute_dialog)
+        self.button(remote, 'Отменить раздачу выбранным', self.cancel_distribution)
         remote = ttk.Frame(outer)
         remote.pack(fill='x', pady=(7, 0))
         self.button(remote, 'Запустить переданный файл…', self.launch_dialog)
@@ -219,7 +220,8 @@ class Manager:
 
     def toggle(self, name):
         owners = getattr(getattr(self, 'operations', None), 'owners', {})
-        if name in owners and name not in self.selected:
+        operation = getattr(getattr(self, 'operations', None), 'active', {}).get(owners.get(name), {})
+        if name in owners and name not in self.selected and operation.get('action') != 'distribute':
             messagebox.showinfo('Компьютер занят', name + ': дождитесь окончания его операции или выберите другой ПК.', parent=self.window)
             return
         if name in self.selected:
@@ -455,6 +457,26 @@ class Manager:
             messagebox.showerror('Папка назначения', str(error), parent=self.window)
             return
         self.begin('distribute', dict(files=list(files), batch=batch, destination=destination))
+
+    def cancel_distribution(self):
+        targets = []
+        for host in self.visible():
+            if host.name not in self.selected:
+                continue
+            operation = self.operations.active.get(self.operations.owners.get(host.name), {})
+            if operation.get('action') == 'distribute':
+                control = operation.get('controls', {}).get(host.name)
+                if control and not control.cancelled.is_set():
+                    targets.append((host.name, control))
+        if not targets:
+            messagebox.showinfo('Отмена раздачи', 'Отметьте ПК, которые ещё получают файлы, затем нажмите «Отменить раздачу выбранным».', parent=self.window)
+            return
+        for name, control in targets:
+            control.cancel()
+            self.statuses[name] = ('Отмена раздачи…', False)
+            self.selected.discard(name)
+        self.refresh()
+        self.summary.set('Отмена раздачи запрошена для ' + str(len(targets)) + ' ПК. Остальные операции продолжаются.')
 
     def transferred_files(self):
         records = []
@@ -755,6 +777,8 @@ class Manager:
         except ValueError as error:
             messagebox.showinfo('Компьютеры заняты', str(error), parent=self.window)
             return
+        if action == 'distribute':
+            operation['controls'] = {host.name: OperationControl(parent=self.shutdown, reason='Раздача отменена пользователем') for host in hosts}
         self.preparing_operation = operation['id']
         self.set_busy(True)
         self.summary.set('Проверка SSH без пароля…')
@@ -886,7 +910,7 @@ class Manager:
             self.set_busy(False)
             self.refresh()
             self.update_activity()
-        threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, job, events, control), daemon=True).start()
+        threading.Thread(target=self.send, args=(host_map, permitted, password, action, minutes, initial_results, job, events, control, operation.get('controls') if operation else None), daemon=True).start()
         password = None
 
     def trust_dialog(self, details):
@@ -917,8 +941,9 @@ class Manager:
         self.window.wait_window(dialog)
         return result[0]
 
-    def distribute_files(self, host_map, rows, password, job, events=None, control=None):
+    def distribute_files(self, host_map, rows, password, job, events=None, control=None, host_controls=None):
         events = events or self.events
+        host_controls = host_controls or {}
         # Prepare each source once; every selected PC gets an independent SFTP session.
         total = sum(Path(path).stat().st_size for path in job['files'])
         done = 0
@@ -927,18 +952,27 @@ class Manager:
             nonlocal done, last_prepare
             if control:
                 control.check()
+            if rows and all(name in host_controls and host_controls[name].cancelled.is_set() for name in (pin['name'] for pin in rows)):
+                raise OperationCancelled('Раздача отменена пользователем')
             done += count
             now = time.monotonic()
             if now - last_prepare >= .2:
                 events.put(('scan_progress', 'Подготовка файлов для всех ПК: SHA-256 ' + str(round(done * 100 / total) if total else 100) + '%'))
                 last_prepare = now
         events.put(('scan_progress', 'Подготовка файлов для одновременной раздачи…'))
-        prepared = {str(Path(path).resolve()): prepare_transfer(path, progress=preparation) for path in job['files']}
+        try:
+            prepared = {str(Path(path).resolve()): prepare_transfer(path, progress=preparation) for path in job['files']}
+        except OperationCancelled as error:
+            results = [dict(name=pin['name'], ip=pin['ip'], action='upload', ok=False, cancelled=True, files=[], message=str(error)) for pin in rows]
+            for result in results:
+                events.put(('result', result))
+            return results
         batch = job.get('batch') or uuid.uuid4().hex
         gate = TransferAccessGate(control)
         events.put(('distribution_started', [pin['name'] for pin in rows]))
         def worker(pin):
             name = pin['name']
+            worker_control = host_controls.get(name, control)
             last_update = 0
             last_phase = None
             def progress(value):
@@ -952,8 +986,8 @@ class Manager:
                 answer = queue.Queue(maxsize=1)
                 events.put(('overwrite', (name, path, answer)))
                 while True:
-                    if control:
-                        control.check()
+                    if worker_control:
+                        worker_control.check()
                     try:
                         return answer.get(timeout=.2)
                     except queue.Empty:
@@ -961,10 +995,12 @@ class Manager:
             try:
                 result = transfer_files(host_map[name], pin, password, job['files'], batch,
                                         destination=job['destination'], progress=progress,
-                                        on_conflict=on_conflict, access_gate=gate, prepared=prepared, **(dict(control=control) if control else {}))
+                                        on_conflict=on_conflict, access_gate=gate, prepared=prepared, **(dict(control=worker_control) if worker_control else {}))
             except Exception as error:
                 result = dict(name=name, ip=pin['ip'], action='upload', ok=False,
                               message=str(error).replace(password, '[СКРЫТО]'))
+                if isinstance(error, OperationCancelled):
+                    result['cancelled'] = True
             result['requested_destination'] = job['destination']
             events.put(('result', result))
             return result
@@ -985,28 +1021,47 @@ class Manager:
         self.summary.set('Раздача файлов: завершено ПК ' + str(complete) + '/' + str(len(state))
                          + '. Прогресс каждого ПК — в столбце «Состояние / результат».')
 
-    def send(self, host_map, rows, password, action, minutes, initial_results, job=None, events=None, control=None):
+    def send_commands(self, host_map, rows, password, job, events, control=None):
+        gate = TransferAccessGate(control)
+        options = dict(control=control) if control else {}
+        events.put(('command_waiting', [pin['name'] for pin in rows]))
+        def worker(pin):
+            name = pin['name']
+            target = job.get('targets', {}).get(name, {})
+            try:
+                result = execute_command(host_map[name], pin, password, job['script'], job['sudo'], job['timeout'],
+                                         cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'),
+                                         progress=lambda value: events.put(('command_progress', dict(value, name=name))),
+                                         access_gate=gate, **options)
+            except Exception as error:
+                result = dict(name=name, ip=pin['ip'], action='command', ok=False,
+                              message=str(error).replace(password, '[СКРЫТО]'))
+            if result.get('stop'):
+                gate.stopped.set()
+            events.put(('result', result))
+            return result
+        if not rows:
+            return []
+        with ThreadPoolExecutor(max_workers=len(rows)) as pool:
+            pending = {pool.submit(worker, pin): pin['name'] for pin in rows}
+            results = {pending[future]: future.result() for future in as_completed(pending)}
+        return [results[pin['name']] for pin in rows]
+
+    def send(self, host_map, rows, password, action, minutes, initial_results, job=None, events=None, control=None, host_controls=None):
         events = events or self.events
         options = dict(control=control) if control else {}
         results = list(initial_results)
         try:
             if action == 'distribute':
-                results.extend(self.distribute_files(host_map, rows, password, job, events, control))
+                results.extend(self.distribute_files(host_map, rows, password, job, events, control, host_controls))
             if action == 'command':
-                events.put(('command_waiting', [pin['name'] for pin in rows]))
-            for index, pin in enumerate([] if action == 'distribute' else rows):
+                results.extend(self.send_commands(host_map, rows, password, job, events, control))
+            for index, pin in enumerate([] if action in ('distribute', 'command') else rows):
                 if control:
                     control.check()
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
                 events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
-                if action == 'command':
-                    target = job.get('targets', {}).get(pin['name'], {})
-                    events.put(('operation_status', label + ': проверка и выполнение команды; ожидание до ' + str(job['timeout']) + ' с. Папка: ' + target.get('cwd', job.get('cwd', '~'))))
-                    result = execute_command(host_map[pin['name']], pin, password, job['script'], job['sudo'], job['timeout'],
-                                             cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'),
-                                             progress=lambda value, name=pin['name']: events.put(('command_progress', dict(value, name=name))), **options)
-                else:
-                    result = execute(host_map[pin['name']], pin, password, action, minutes, **options)
+                result = execute(host_map[pin['name']], pin, password, action, minutes, **options)
                 results.append(result)
                 events.put(('result', result))
                 if result.get('stop'):
@@ -1029,6 +1084,10 @@ class Manager:
             if kind == 'overwrite':
                 value[2].put(False)
             return
+        if operation_id and kind == 'distribution_progress':
+            target_control = operation.get('controls', {}).get(value['name'])
+            if target_control and target_control.cancelled.is_set():
+                return
         if operation_id and kind in ('result', 'command_progress', 'distribution_progress'):
             if self.operations.owners.get(value['name']) != operation_id:
                 return  # Late events cannot replace a newer operation's row.
@@ -1057,11 +1116,12 @@ class Manager:
             results, report = value
             self.last_results = results
             good = sum(r['ok'] for r in results)
+            cancelled = sum(bool(r.get('cancelled')) for r in results)
             if operation_id:
                 self.finish_operation(operation_id)
             else:
                 self.set_busy(False)
-            self.summary.set('Готово: успешно ' + str(good) + ', ошибок/пропусков ' + str(len(results) - good) + '. Отчёт: ' + report)
+            self.summary.set('Готово: успешно ' + str(good) + ', отменено ' + str(cancelled) + ', ошибок/пропусков ' + str(len(results) - good - cancelled) + '. Отчёт: ' + report)
             if operation_id and self.operations.active:
                 self.update_activity()
         elif kind == 'command_waiting':
@@ -1089,7 +1149,8 @@ class Manager:
             else:
                 self.distribution_state = states
             for name in value:
-                self.statuses[name] = ('Ожидает подключения для раздачи', False)
+                target_control = operation.get('controls', {}).get(name) if operation else None
+                self.statuses[name] = ('Отмена раздачи…' if target_control and target_control.cancelled.is_set() else 'Ожидает подключения для раздачи', False)
             self.refresh()
             show_progress()
         elif kind == 'distribution_progress':
@@ -1109,6 +1170,10 @@ class Manager:
             self.range_results(value)
         elif kind == 'overwrite':
             name, path, answer = value
+            target_control = operation.get('controls', {}).get(name) if operation else None
+            if target_control and target_control.cancelled.is_set():
+                answer.put(False)
+                return
             try:
                 overwrite = messagebox.askyesno('Перезаписать файл?', name + '\nФайл уже существует:\n' + path + '\n\nЗаменить его выбранным файлом учителя? При ответе «Нет» этот файл будет пропущен.', default='no', icon='warning', parent=self.window)
             except Exception:

@@ -332,6 +332,29 @@ class UploadTests(unittest.TestCase):
         self.assertIn('после подготовки', result['message'])
 
 
+    def test_cancel_during_second_file_keeps_first_verified_file(self):
+        second = self.base / 'setup.sh'
+        second.write_bytes(b'echo hello')
+        parent = core.OperationControl()
+        control = core.OperationControl(parent=parent, reason='Раздача отменена пользователем')
+        sftp = self.client.open_sftp()
+        original_put = sftp.put
+        def put(source, target, callback, confirm):
+            if source == str(second):
+                control.cancel()
+            return original_put(source, target, confirm, callback)
+        sftp.put = put
+        self.client.open_sftp = lambda: sftp
+        with patch.object(core, 'connect_verified', return_value=self.client):
+            result = core.transfer_files(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret',
+                                         [str(self.source), str(second)], 'batch', control=control)
+        self.assertTrue(result['cancelled'])
+        self.assertFalse(result['ok'])
+        self.assertEqual(len(result['files']), 1)
+        self.assertEqual((self.inbox / self.source.name).read_bytes(), self.source.read_bytes())
+        self.assertFalse((self.inbox / second.name).exists())
+        self.assertFalse(parent.cancelled.is_set())
+
 
 class ScanIdentityTests(unittest.TestCase):
     def inspect(self, replies, dns='192.168.22.26', auth_error=None):
@@ -775,6 +798,167 @@ class ConcurrentOperationsTests(unittest.TestCase):
             core.run(client, 'another', control=control)
         open_session.assert_called_once()
 
+
+    def test_cancel_selected_distribution_keeps_siblings_and_other_operations(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            batch = app.operations.start('distribute', app.hosts[:2], {})
+            other = app.operations.start('command', app.hosts[2:], {})
+            batch['state'] = other['state'] = 'running'
+            batch['controls'] = {host.name: core.OperationControl(parent=app.shutdown, reason='Раздача отменена пользователем') for host in app.hosts[:2]}
+            clients = [types.SimpleNamespace(close=Mock()) for _ in app.hosts]
+            batch['controls']['a209-01'].add(clients[0])
+            batch['controls']['a209-02'].add(clients[1])
+            app.shutdown.add(clients[2])
+            app.table.focus = lambda name: None
+            app.toggle('a209-01')
+            app.selected.add('a208-01')  # The cancel button must ignore a command target.
+            app.cancel_distribution()
+            clients[0].close.assert_called_once()
+            clients[1].close.assert_not_called()
+            clients[2].close.assert_not_called()
+            self.assertFalse(app.shutdown.cancelled.is_set())
+            self.assertEqual(app.operations.owners['a209-01'], batch['id'])
+            self.assertIn('Отмена', app.statuses['a209-01'][0])
+            app.handle_event('distribution_progress', dict(name='a209-01', phase='late', done=9, total=10), batch['id'])
+            self.assertIn('Отмена', app.statuses['a209-01'][0])
+            app.handle_event('result', dict(name='a209-01', action='upload', ok=False, cancelled=True, message='Раздача отменена пользователем'), batch['id'])
+            self.assertNotIn('a209-01', app.operations.owners)
+            self.assertEqual(app.operations.owners['a209-02'], batch['id'])
+            self.assertEqual(app.operations.owners['a208-01'], other['id'])
+            app.shutdown.cancel()
+            clients[1].close.assert_called_once()
+            clients[2].close.assert_called_once()
+
+    def test_cancel_overwrite_wait_on_one_pc_does_not_finish_other_pc(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            path = Path(directory) / 'lesson.txt'
+            path.write_text('lesson')
+            operation = app.operations.start('distribute', app.hosts[:2], {})
+            operation['state'] = 'running'
+            operation['controls'] = {host.name: core.OperationControl(parent=app.shutdown, reason='Раздача отменена пользователем') for host in app.hosts[:2]}
+            sibling_started, release_sibling = threading.Event(), threading.Event()
+            def transfer(host, pin, password, paths, batch, on_conflict, control, **kwargs):
+                if host.name == 'a209-01':
+                    on_conflict('/home/user/lesson.txt')
+                    raise AssertionError('The cancelled overwrite wait should not resume')
+                sibling_started.set()
+                self.assertTrue(release_sibling.wait(4))
+                control.check()
+                return dict(name=host.name, ip=pin['ip'], action='upload', ok=True, files=[], message='Передано')
+            pins = [dict(name=h.name, ip='192.168.22.1') for h in app.hosts[:2]]
+            with patch.object(gui, 'transfer_files', transfer):
+                thread = threading.Thread(target=app.send, args=({h.name: h for h in app.hosts[:2]}, pins, 'secret', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), gui.OperationEvents(app.events, operation['id']), app.shutdown, operation['controls']))
+                thread.start()
+                try:
+                    while True:
+                        kind, payload = app.events.get(timeout=2)
+                        identifier, kind, value = payload
+                        if kind == 'overwrite':
+                            break  # Leave the question unanswered, then cancel this host.
+                        app.handle_event(kind, value, identifier)
+                    self.assertTrue(sibling_started.wait(2))
+                    app.selected = {'a209-01'}
+                    app.cancel_distribution()
+                    self.process_until(app, lambda: 'a209-01' not in app.operations.owners)
+                    self.assertIn('a209-02', app.operations.owners)
+                    self.assertFalse(app.shutdown.cancelled.is_set())
+                finally:
+                    release_sibling.set()
+                    thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.process_until(app, lambda: not app.operations.active)
+            report = json.loads(next((app.data / 'reports').glob('*.json')).read_text())
+            self.assertTrue(report[0]['cancelled'])
+            self.assertTrue(report[1]['ok'])
+
+    def test_eight_commands_start_before_any_command_finishes(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            hosts = [core.Host('a209-' + str(n), '', '209') for n in range(1, 9)]
+            rows = [dict(name=h.name, ip='192.168.22.1') for h in hosts]
+            barrier = threading.Barrier(len(hosts), timeout=3)
+            def connect(host, pin, password, **kwargs):
+                return types.SimpleNamespace(name=host.name, close=lambda: None)
+            def run(client, command, **kwargs):
+                kwargs['on_progress'](dict(elapsed=1, output='running ' + client.name))
+                barrier.wait()
+                return 0, 'done ' + client.name
+            with patch.object(core, 'connect_verified', connect), patch.object(core, 'run', run):
+                app.send({h.name: h for h in hosts}, rows, 'secret', 'command', 0, [], dict(script='hostname', sudo=False, timeout=30, cwd='~'))
+            report = json.loads(next((app.data / 'reports').glob('*.json')).read_text())
+            self.assertEqual([r['name'] for r in report], [h.name for h in hosts])
+            self.assertTrue(all(r['ok'] for r in report), report)
+            progress = []
+            while not app.events.empty():
+                kind, value = app.events.get()
+                if kind == 'command_progress': progress.append(value)
+            self.assertEqual({r['name'] for r in progress}, {h.name for h in hosts})
+
+    def test_parallel_commands_stop_new_password_attempts_after_first_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            hosts = [core.Host('a209-' + str(n), '', '209') for n in range(1, 9)]
+            rows = [dict(name=h.name, ip='192.168.22.1') for h in hosts]
+            with patch.object(core, 'connect_verified', side_effect=paramiko.AuthenticationException('wrong')) as connect, patch.object(core, 'run') as run:
+                app.send({h.name: h for h in hosts}, rows, 'secret', 'command', 0, [], dict(script='id', sudo=False, timeout=30))
+            connect.assert_called_once()
+            run.assert_not_called()
+            report = json.loads(next((app.data / 'reports').glob('*.json')).read_text())
+            self.assertEqual(len(report), 8)
+            self.assertEqual(sum(r.get('stop', False) for r in report), 1)
+            self.assertEqual(sum('Пропущен' in r['message'] for r in report), 7)
+
+    def test_sudo_password_failure_blocks_next_command_without_reconnecting(self):
+        gate = core.TransferAccessGate()
+        client = types.SimpleNamespace(close=lambda: None)
+        host, pin = core.Host('a209-01', '', '209'), dict(ip='192.168.22.1')
+        with patch.object(core, 'connect_verified', return_value=client) as connect, patch.object(core, 'run', return_value=(1, 'incorrect password')) as run:
+            first = core.execute_command(host, pin, 'secret', 'id', sudo=True, access_gate=gate)
+            second = core.execute_command(host, pin, 'secret', 'id', sudo=True, access_gate=gate)
+        self.assertTrue(first['stop'])
+        self.assertFalse(second['ok'])
+        self.assertIn('Пропущен', second['message'])
+        connect.assert_called_once()
+        run.assert_called_once()
+
+    def test_all_targets_cancelled_during_preparation_never_start_transfer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.app(directory)
+            path = Path(directory) / 'lesson.txt'
+            path.write_text('lesson')
+            controls = {host.name: core.OperationControl(parent=app.shutdown, reason='Раздача отменена пользователем') for host in app.hosts[:2]}
+            for control in controls.values(): control.cancel()
+            rows = [dict(name=h.name, ip='192.168.22.1') for h in app.hosts[:2]]
+            with patch.object(gui, 'transfer_files') as transfer:
+                app.send({h.name: h for h in app.hosts[:2]}, rows, 'secret', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), control=app.shutdown, host_controls=controls)
+            transfer.assert_not_called()
+            report = json.loads(next((app.data / 'reports').glob('*.json')).read_text())
+            self.assertEqual(len(report), 2)
+            self.assertTrue(all(r['cancelled'] for r in report))
+            self.assertFalse(app.shutdown.cancelled.is_set())
+
+
+    def test_cancelling_authentication_does_not_stop_sibling_transfers(self):
+        parent = core.OperationControl()
+        cancelled = core.OperationControl(parent=parent, reason='Раздача отменена пользователем')
+        sibling = core.OperationControl(parent=parent)
+        gate = core.TransferAccessGate(parent)
+        def connect(host, pin, password, control):
+            if host.name == 'a209-01':
+                control.cancel()
+                raise paramiko.AuthenticationException('transport closed')
+            return 'connected sibling'
+        with patch.object(core, 'connect_verified', connect):
+            with self.assertRaises(core.OperationCancelled):
+                gate.connect(core.Host('a209-01', '', '209'), {}, 'secret', control=cancelled)
+            self.assertFalse(gate.stopped.is_set())
+            self.assertEqual(gate.connect(core.Host('a209-02', '', '209'), {}, 'secret', control=sibling), 'connected sibling')
+        self.assertFalse(parent.cancelled.is_set())
 
 if __name__ == '__main__':
     unittest.main()

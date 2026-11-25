@@ -14,29 +14,43 @@ import time
 import threading
 
 
+class OperationCancelled(RuntimeError):
+    pass
+
+
 class OperationControl:
     """Close live connections and stop queued work when the user exits."""
-    def __init__(self):
+    def __init__(self, parent=None, reason='Операция остановлена при закрытии CM; проверьте ПК перед повтором'):
+        self.parent, self.reason = parent, reason
         self.cancelled = threading.Event()
         self.lock = threading.Lock()
         self.clients = {}
 
     def check(self):
         if self.cancelled.is_set():
-            raise RuntimeError('Операция остановлена при закрытии CM; проверьте ПК перед повтором')
+            raise OperationCancelled(self.reason)
+        if self.parent:
+            self.parent.check()
 
     def add(self, client):
+        if self.parent:
+            self.parent.add(client)
         with self.lock:
             stopped = self.cancelled.is_set()
             if not stopped:
                 self.clients[id(client)] = client
         if stopped:
+            if self.parent:
+                self.parent.discard(client)
             client.close()
             self.check()
+        self.check()
 
     def discard(self, client):
         with self.lock:
             self.clients.pop(id(client), None)
+        if self.parent:
+            self.parent.discard(client)
 
     def cancel(self):
         with self.lock:
@@ -44,6 +58,8 @@ class OperationControl:
             clients = list(self.clients.values())
             self.clients.clear()
         for client in clients:
+            if self.parent:
+                self.parent.discard(client)
             try:
                 client.close()
             except Exception:
@@ -365,7 +381,9 @@ def connect_verified(host, pin, password, control=None):
 
 def operation_error(result, error, password):
     import paramiko
-    if isinstance(error, paramiko.AuthenticationException):
+    if isinstance(error, OperationCancelled):
+        result.update(cancelled=True, message=str(error))
+    elif isinstance(error, paramiko.AuthenticationException):
         result.update(stop=True, message='Ошибка доступа SSH; дальнейшие попытки остановлены')
     elif isinstance(error, paramiko.BadHostKeyException):
         result['message'] = 'SSH-ключ изменился; пароль не отправлен'
@@ -432,7 +450,7 @@ def ensure_remote_directory(sftp, destination, reject_existing=False):
             sftp.mkdir(current, 0o700)
 
 
-def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None, progress=None, control=None):
+def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=None, expected_file=None, progress=None, control=None, access_gate=None):
     if not script.strip() or len(script.encode('utf-8')) > 32 * 1024 or '\x00' in script:
         raise ValueError('Введите команду длиной до 32 КБ без NUL')
     if type(timeout) is not int or not 10 <= timeout <= 1800:
@@ -456,7 +474,9 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
     notify('Подключение и проверка имени/ОС')
     try:
         connection = dict(control=control) if control else {}
-        client = connect_verified(host, pin, password, **connection)
+        client = access_gate.connect(host, pin, password, **connection) if access_gate else connect_verified(host, pin, password, **connection)
+        if access_gate:
+            access_gate.check()
         if expected_file is not None:
             notify('Проверка переданного файла SHA-256')
             check = '/usr/bin/sha256sum -- ' + shell_directory(expected_file['path'])
@@ -467,6 +487,8 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
         command = ('LC_ALL=C sudo -k -S -p \'\' ' if sudo else '') + '/bin/bash -c ' + shlex.quote(script)
         if cwd is not None:
             command = '/bin/bash -c ' + shlex.quote('cd -- ' + shell_directory(cwd) + ' && ' + command)
+        if access_gate:
+            access_gate.check()
         notify('Выполняется')
         options = dict(password=password if sudo else None, timeout=timeout, **connection)
         if progress:
@@ -483,6 +505,8 @@ def execute_command(host, pin, password, script, sudo=False, timeout=300, cwd=No
     except Exception as error:
         operation_error(result, error, password)
     finally:
+        if access_gate and result.get('stop'):
+            access_gate.stopped.set()
         if client:
             client.close()
             if control:
@@ -529,7 +553,7 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
     sftp = None
     try:
         connection = dict(control=control) if control else {}
-        client = access_gate.connect(host, pin, password) if access_gate else connect_verified(host, pin, password, **connection)
+        client = access_gate.connect(host, pin, password, **connection) if access_gate else connect_verified(host, pin, password, **connection)
         sftp = client.open_sftp()
         sftp.get_channel().settimeout(60)
         home = sftp.normalize('.')
@@ -610,6 +634,11 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
     except TransferStopped as error:
         result.update(message=str(error), cancelled=True)
     except Exception as error:
+        if control:
+            try:
+                control.check()
+            except OperationCancelled as cancelled:
+                error = cancelled
         operation_error(result, error, password)
         # Keep already verified files and list them in the report on partial failure.
     finally:
@@ -728,14 +757,19 @@ class TransferAccessGate:
         if self.stopped.is_set():
             raise TransferStopped('Пропущен после ошибки доступа; повторных попыток нет')
 
-    def connect(self, host, pin, password):
+    def connect(self, host, pin, password, control=None):
         import paramiko
         with self.lock:
             self.check()
             try:
-                options = dict(control=self.control) if self.control else {}
+                effective = control or self.control
+                if effective:
+                    effective.check()
+                options = dict(control=effective) if effective else {}
                 return connect_verified(host, pin, password, **options)
             except paramiko.AuthenticationException:
+                if effective:
+                    effective.check()  # Closing one transfer is not a password failure.
                 self.stopped.set()
                 raise
 
