@@ -1,0 +1,14 @@
+CM Astra 1.2; 25.11.2026
+...................................
+----------------------------------------------------------------------
+Ran 35 tests in 0.008s
+
+OK
+
+..................
+----------------------------------------------------------------------
+Ran 18 tests in 0.008s
+
+OK
+
+Tests use fake SSH/SFTP and platform vault APIs. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.
