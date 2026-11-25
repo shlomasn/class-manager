@@ -1001,6 +1001,17 @@ class ConcurrentOperationsTests(unittest.TestCase):
             self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
             self.assertFalse(control.stop_requested.is_set())
 
+    def test_invalid_theme_preferences_fall_back_safely(self):
+        import cm_ui
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ui.json'
+            self.assertEqual(cm_ui.load_theme(path), 'light')
+            for text in ['invalid json', '[]', '{"theme":[]}', '{"theme":{}}', '{"theme":"unknown"}']:
+                path.write_text(text)
+                self.assertEqual(cm_ui.load_theme(path), 'light')
+            path.write_text('{"version":1,"theme":"dark"}')
+            self.assertEqual(cm_ui.load_theme(path), 'dark')
+
 
 class ManagedCommandTests(unittest.TestCase):
     def local_client(self):

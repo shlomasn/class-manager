@@ -15,6 +15,7 @@ import uuid
 
 from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl
 import credential_store
+import cm_ui
 
 ROOT = Path(__file__).resolve().parent
 
@@ -72,6 +73,8 @@ class Manager:
         self.window = window
         self.data = Path(data) if data else data_directory()
         self.data.mkdir(parents=True, exist_ok=True)
+        self.ui_file = self.data / 'ui.json'
+        self.theme = tk.StringVar(value=cm_ui.load_theme(self.ui_file))
         self.host_file = self.data / 'computers.json'
         self.trust_file = self.data / 'trusted-keys.json'
         self.inventory_file = self.data / 'inventory.json'
@@ -96,110 +99,314 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 1.9 — управление школьными компьютерами')
-        window.geometry(str(min(1100, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
+        window.title('CM Astra 2.0 — управление школьными компьютерами')
+        window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
         self.build()
         self.refresh()
+        cm_ui.color_widgets(self.window, self.palette)
         self.window.after(100, self.poll)
 
-    def button(self, frame, text, command):
-        widget = ttk.Button(frame, text=text, command=command)
+    def button(self, frame, text, command, style=None):
+        widget = ttk.Button(frame, text=text, command=command, style=style or 'TButton')
         widget.pack(side='left', padx=(0, 7))
         self.controls.append(widget)
         return widget
 
+    def menu_action(self, menu, text, command, inventory=False):
+        menu.add_command(label=text, command=command)
+        self.menu_controls.append((menu, menu.index('end'), inventory))
+
     def build(self):
-        outer = ttk.Frame(self.window, padding=18)
-        outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text='Управление компьютерами Astra Linux', font=('Segoe UI', 17, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='Отметьте свободные ПК. Завершившие работу ПК доступны сразу; остальные операции продолжаются в фоне.').pack(anchor='w', pady=(5, 15))
-        toolbar = ttk.Frame(outer)
-        toolbar.pack(fill='x', pady=(0, 10))
-        ttk.Label(toolbar, text='Кабинет:').pack(side='left', padx=(0, 6))
+        self.palette = cm_ui.PALETTES[self.theme.get()]
+        cm_ui.configure_styles(self.window, self.theme.get())
+        self.menu_controls = []
+        self.window.grid_rowconfigure(0, weight=1)
+        self.window.grid_columnconfigure(1, weight=1)
+        sidebar = ttk.Frame(self.window, style='Surface.TFrame', padding=(14, 20), width=184)
+        sidebar.grid(row=0, column=0, sticky='nsew')
+        sidebar.grid_propagate(False)
+        sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(2, weight=1)
+        brand = ttk.Frame(sidebar, style='Surface.TFrame')
+        brand.grid(row=0, column=0, sticky='ew', pady=(0, 22))
+        ttk.Label(brand, text='CM', style='Brand.TLabel').pack(side='left', padx=(0, 10))
+        ttk.Label(brand, text='Управление\nклассом', style='Surface.TLabel').pack(side='left')
+        ttk.Label(sidebar, text='КАБИНЕТЫ', style='Side.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 8))
+        room_frame = ttk.Frame(sidebar, style='Surface.TFrame')
+        room_frame.grid(row=2, column=0, sticky='nsew')
         self.room = tk.StringVar(value='Все кабинеты')
-        self.room_box = ttk.Combobox(toolbar, textvariable=self.room, state='readonly', width=17)
-        self.room_box.pack(side='left', padx=(0, 15))
-        self.room_box.bind('<<ComboboxSelected>>', lambda event: self.change_room())
-        self.button(toolbar, 'Выбрать все в списке', self.select_visible)
-        self.button(toolbar, 'Снять выбор', self.clear_selection)
-        self.inventory_controls.append(self.button(toolbar, 'Открыть .lst / .json', self.import_list))
-        editing = ttk.Frame(outer)
-        editing.pack(fill='x', pady=(0, 10))
-        self.inventory_controls.append(self.button(editing, 'Добавить ПК', self.add_host))
-        self.inventory_controls.append(self.button(editing, 'Изменить ПК', self.edit_host))
-        self.inventory_controls.append(self.button(editing, 'Удалить отмеченные', self.remove_hosts))
-        groups = ttk.Frame(outer)
-        groups.pack(fill='x', pady=(0, 10))
-        self.inventory_controls.append(self.button(groups, 'Добавить класс', self.add_room))
-        self.inventory_controls.append(self.button(groups, 'Удалить класс', self.remove_room))
-        self.inventory_controls.append(self.button(groups, 'Перенести отмеченные в класс…', self.move_hosts))
-        self.inventory_controls.append(self.button(groups, 'Поиск по диапазону IP…', self.scan_range))
-        table_frame = ttk.Frame(outer)
-        table_frame.pack(fill='both', expand=True)
-        columns = ('check', 'name', 'ip', 'status')
-        self.table = ttk.Treeview(table_frame, columns=columns, show='headings', selectmode='browse', height=5)
-        for name, title, width in [('check', 'Выбор', 60), ('name', 'Компьютер', 160), ('ip', 'IP-адрес', 155), ('status', 'Состояние / результат', 540)]:
+        self.room_list = ttk.Treeview(room_frame, show='tree', selectmode='browse', style='Rooms.Treeview', height=5)
+        self.room_list.column('#0', width=142, minwidth=80, stretch=True)
+        self.room_list.pack(side='left', fill='both', expand=True)
+        room_scroll = ttk.Scrollbar(room_frame, orient='vertical', command=self.room_list.yview)
+        room_scroll.pack(side='right', fill='y')
+        self.room_list.configure(yscrollcommand=room_scroll.set)
+        self.room_list.bind('<<TreeviewSelect>>', self.room_selected)
+
+        settings = ttk.Menubutton(sidebar, text='Управление и настройки')
+        settings.grid(row=3, column=0, sticky='ew', pady=(15, 10))
+        self.controls.append(settings)
+        menu = tk.Menu(settings, tearoff=False)
+        settings.configure(menu=menu)
+        computers = tk.Menu(menu, tearoff=False)
+        menu.add_cascade(label='Компьютеры', menu=computers)
+        for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
+                              ('Удалить отмеченные ПК…', self.remove_hosts), ('Перенести отмеченные в кабинет…', self.move_hosts),
+                              ('Открыть список .lst / .json…', self.import_list), ('Найти ПК по IP…', self.scan_range)]:
+            self.menu_action(computers, text, command, inventory=True)
+        rooms = tk.Menu(menu, tearoff=False)
+        menu.add_cascade(label='Кабинеты', menu=rooms)
+        self.menu_action(rooms, 'Добавить кабинет…', self.add_room, inventory=True)
+        self.menu_action(rooms, 'Удалить текущий кабинет…', self.remove_room, inventory=True)
+        menu.add_separator()
+        self.menu_action(menu, 'Сохранить / изменить пароль…', self.save_password)
+        self.menu_action(menu, 'Забыть сохранённый пароль', self.forget_password)
+        menu.add_separator()
+        self.menu_action(menu, 'Результаты последней операции', self.show_results)
+        self.credential_status = tk.StringVar(value='Пароль хранится в системном хранилище')
+        ttk.Label(sidebar, textvariable=self.credential_status, style='Side.TLabel', wraplength=150).grid(row=4, column=0, sticky='w')
+        appearance = ttk.Frame(sidebar, style='Surface.TFrame')
+        appearance.grid(row=5, column=0, sticky='ew', pady=(14, 0))
+        ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
+        for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
+            ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
+        ttk.Label(sidebar, text='CM 2.0 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+
+        main = ttk.Frame(self.window, padding=(22, 18))
+        main.grid(row=0, column=1, sticky='nsew')
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(4, weight=1, minsize=85)
+        header = ttk.Frame(main)
+        header.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        self.room_title = tk.StringVar(value='Все кабинеты')
+        header.grid_columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self.room_title, style='Title.TLabel').grid(row=0, column=0, sticky='ew', padx=(0, 12))
+        check = ttk.Button(header, text='Проверить связь', command=lambda: self.begin('scan'))
+        check.grid(row=0, column=1, sticky='e')
+        self.controls.append(check)
+        self.overview = tk.StringVar(value='Компьютеры учеников')
+        ttk.Label(main, textvariable=self.overview, style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 12))
+
+        toolbar = ttk.Frame(main, style='Surface.TFrame', padding=(10, 9))
+        toolbar.grid(row=2, column=0, sticky='ew', pady=(0, 8))
+        self.button(toolbar, 'Раздать файлы', self.distribute_dialog, 'Primary.TButton')
+        self.button(toolbar, 'Команда…', self.command_dialog)
+        self.button(toolbar, 'Запустить файл…', self.launch_dialog)
+        power = ttk.Menubutton(toolbar, text='Питание')
+        power.pack(side='left')
+        self.controls.append(power)
+        power_menu = tk.Menu(power, tearoff=False)
+        power.configure(menu=power_menu)
+        self.menu_action(power_menu, 'Выключить…', lambda: self.begin('off'))
+        self.menu_action(power_menu, 'Перезагрузить…', lambda: self.begin('reboot'))
+        self.menu_action(power_menu, 'Отменить запланированное выключение / перезагрузку…', lambda: self.begin('cancel'))
+        stopping = ttk.Menubutton(toolbar, text='Остановить')
+        stopping.pack(side='right')
+        self.controls.append(stopping)
+        stop_menu = tk.Menu(stopping, tearoff=False)
+        stopping.configure(menu=stop_menu)
+        self.menu_action(stop_menu, 'Отменить раздачу выбранным', self.cancel_distribution)
+        self.menu_action(stop_menu, 'Остановить команды выбранным…', self.stop_commands)
+
+        selection = ttk.Frame(main)
+        selection.grid(row=3, column=0, sticky='ew', pady=(0, 8))
+        self.counter = tk.StringVar()
+        ttk.Label(selection, textvariable=self.counter, style='Section.TLabel').pack(side='left', padx=(0, 12))
+        self.button(selection, 'Выбрать свободные', self.select_visible)
+        self.button(selection, 'Снять выбор', self.clear_selection)
+        ttk.Label(selection, text='Питание через', style='Muted.TLabel').pack(side='left', padx=(8, 5))
+        self.delay = tk.StringVar(value='1')
+        self.delay_box = ttk.Combobox(selection, textvariable=self.delay, state='readonly', values=('0', '1', '2', '5', '10', '15', '30'), width=3)
+        self.delay_box.pack(side='left')
+        ttk.Label(selection, text='мин.', style='Muted.TLabel').pack(side='left', padx=(4, 0))
+
+        table_frame = ttk.Frame(main, style='Surface.TFrame')
+        table_frame.grid(row=4, column=0, sticky='nsew')
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+        columns = ('check', 'name', 'ip', 'status', 'stop')
+        self.table = ttk.Treeview(table_frame, columns=columns, show='headings', selectmode='browse', height=8)
+        for name, title, width, minimum in [('check', 'Выбор', 52, 48), ('name', 'Компьютер', 135, 112),
+                                            ('ip', 'IP-адрес', 133, 115), ('status', 'Состояние / результат', 370, 155),
+                                            ('stop', 'Действие', 90, 85)]:
             self.table.heading(name, text=title)
-            self.table.column(name, width=width, minwidth=width if name != 'status' else 260, stretch=name == 'status')
-        self.table.tag_configure('chosen', background='#e8f1fa')
-        self.table.tag_configure('error', foreground='#a32121')
-        self.table.pack(side='left', fill='both', expand=True)
+            self.table.column(name, width=width, minwidth=minimum, stretch=name == 'status')
+        self.table.tag_configure('chosen', background=self.palette['tint'])
+        self.table.tag_configure('error', foreground=self.palette['error'])
+        self.table.grid(row=0, column=0, sticky='nsew')
         scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
-        scrollbar.pack(side='right', fill='y')
-        self.table.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        horizontal = ttk.Scrollbar(table_frame, orient='horizontal', command=self.table.xview)
+        horizontal.grid(row=1, column=0, sticky='ew')
+        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
         self.table.bind('<Button-1>', self.clicked)
         self.table.bind('<space>', self.key_toggle)
-        self.counter = tk.StringVar()
-        ttk.Label(outer, textvariable=self.counter).pack(anchor='w', pady=(8, 12))
-        actions = ttk.Frame(outer)
-        actions.pack(fill='x')
-        self.button(actions, 'Проверить связь', lambda: self.begin('scan'))
-        self.button(actions, 'Выключить…', lambda: self.begin('off'))
-        self.button(actions, 'Перезагрузить…', lambda: self.begin('reboot'))
-        self.button(actions, 'Отменить выключение', lambda: self.begin('cancel'))
-        remote = ttk.Frame(outer)
-        remote.pack(fill='x', pady=(10, 0))
-        self.button(remote, 'Раздать файлы', self.distribute_dialog)
-        self.button(remote, 'Отменить раздачу выбранным', self.cancel_distribution)
-        remote = ttk.Frame(outer)
-        remote.pack(fill='x', pady=(7, 0))
-        self.button(remote, 'Запустить переданный файл…', self.launch_dialog)
-        self.button(remote, 'Выполнить команду…', self.command_dialog)
-        self.button(remote, 'Остановить команды выбранным', self.stop_commands)
-        self.button(remote, 'Результаты', self.show_results)
-        delay_row = ttk.Frame(outer)
-        delay_row.pack(fill='x', pady=(12, 12))
-        ttk.Label(delay_row, text='Выключение и перезагрузка через:').pack(side='left')
-        self.delay = tk.StringVar(value='1')
-        self.delay_box = ttk.Combobox(delay_row, textvariable=self.delay, state='readonly', values=('0', '1', '2', '5', '10', '15', '30'), width=4)
-        self.delay_box.pack(side='left', padx=6)
-        ttk.Label(delay_row, text='мин.  •  0 = немедленно. Для DHCP адрес определяется по имени.').pack(side='left')
-        credentials = ttk.Frame(outer)
-        credentials.pack(fill='x', pady=(0, 10))
-        self.button(credentials, 'Сохранить / изменить пароль…', self.save_password)
-        self.button(credentials, 'Забыть пароль', self.forget_password)
-        self.credential_status = tk.StringVar(value='Хранилище: Windows Credentials / Linux Secret Service')
-        ttk.Label(credentials, textvariable=self.credential_status).pack(side='left')
-        self.progress = ttk.Progressbar(outer, mode='indeterminate')
-        self.progress.pack(fill='x', pady=(0, 7))
-        self.summary = tk.StringVar(value='Готово. Сначала отметьте компьютеры в столбце «Выбор».')
-        ttk.Label(outer, textvariable=self.summary, wraplength=940).pack(anchor='w')
+        self.table.bind('<Return>', lambda event: self.stop_for_host(self.table.focus()))
+
+        tasks = ttk.Frame(main)
+        tasks.grid(row=5, column=0, sticky='ew', pady=(12, 8))
+        task_header = ttk.Frame(tasks)
+        task_header.pack(fill='x', pady=(0, 5))
+        self.task_caption = tk.StringVar(value='Текущие операции')
+        ttk.Label(task_header, textvariable=self.task_caption, style='Section.TLabel').pack(side='left')
+        results = self.button(task_header, 'Результаты', self.show_results)
+        results.pack_configure(side='right', padx=0)
+        task_body = ttk.Frame(tasks, style='Surface.TFrame')
+        task_body.pack(fill='x')
+        self.task_table = ttk.Treeview(task_body, columns=('action', 'hosts', 'state'), show='headings', height=2, selectmode='browse')
+        for name, title, width in [('action', 'Операция', 200), ('hosts', 'Компьютеры', 140), ('state', 'Ход выполнения', 260)]:
+            self.task_table.heading(name, text=title)
+            self.task_table.column(name, width=width, minwidth=100, stretch=True)
+        self.task_table.pack(side='left', fill='x', expand=True)
+        task_scroll = ttk.Scrollbar(task_body, orient='vertical', command=self.task_table.yview)
+        task_scroll.pack(side='right', fill='y')
+        self.task_table.configure(yscrollcommand=task_scroll.set)
+        self.task_table.bind('<Double-1>', lambda event: self.show_operation())
+        self.task_table.bind('<Return>', lambda event: self.show_operation())
+
+        footer = ttk.Frame(main)
+        footer.grid(row=6, column=0, sticky='ew')
+        self.progress = ttk.Progressbar(footer, mode='indeterminate')
+        self.progress.pack(fill='x', pady=(0, 6))
+        self.summary = tk.StringVar(value='Отметьте нужные ПК. Для остановки можно отметить и занятые компьютеры.')
+        self.summary_label = ttk.Label(footer, textvariable=self.summary, style='Muted.TLabel', wraplength=730)
+        self.summary_label.pack(fill='x', anchor='w')
+        main.bind('<Configure>', lambda event: self.summary_label.configure(wraplength=max(240, event.width - 44)))
+
+    def apply_theme(self):
+        value = self.theme.get()
+        if value not in cm_ui.PALETTES:
+            return
+        self.palette = cm_ui.PALETTES[value]
+        cm_ui.configure_styles(self.window, value)
+        cm_ui.color_widgets(self.window, self.palette)
+        self.table.tag_configure('chosen', background=self.palette['tint'])
+        self.table.tag_configure('error', foreground=self.palette['error'])
+        try:
+            atomic_json(self.ui_file, dict(version=1, theme=value))
+        except OSError as error:
+            messagebox.showerror('Оформление', 'Тема применена, но сохранить выбор не удалось: ' + str(error), parent=self.window)
+
+    def refresh_rooms(self):
+        entries = cm_ui.room_entries(self.rooms, self.hosts)
+        self.room_ids = {'room-' + str(index): name for index, (name, count) in enumerate(entries)}
+        expected = set(self.room_ids)
+        for identifier in self.room_list.get_children():
+            if identifier not in expected:
+                self.room_list.delete(identifier)
+        for index, (name, count) in enumerate(entries):
+            identifier = 'room-' + str(index)
+            text = ('Все кабинеты' if index == 0 else 'Кабинет ' + name) + '  ·  ' + str(count)
+            if self.room_list.exists(identifier):
+                self.room_list.item(identifier, text=text)
+            else:
+                self.room_list.insert('', 'end', iid=identifier, text=text)
+            if name == self.room.get():
+                self.room_list.selection_set(identifier)
+
+    def room_selected(self, event=None):
+        if self.busy:
+            return
+        selection = self.room_list.selection()
+        name = self.room_ids.get(selection[0]) if selection else None
+        if name is not None and name != self.room.get():
+            self.room.set(name)
+            self.change_room()
+
+    def refresh_dashboard(self):
+        if not hasattr(self, 'task_table'):
+            return
+        visible = self.visible()
+        occupied = self.operations.owners
+        busy = sum(host.name in occupied for host in visible)
+        selected = sum(host.name in self.selected for host in visible)
+        errors = sum(self.statuses.get(host.name, ('', False))[1] for host in visible if host.name not in occupied)
+        self.room_title.set(self.room.get() if self.room.get() == 'Все кабинеты' else 'Кабинет ' + self.room.get())
+        self.overview.set(str(len(visible)) + ' ПК в списке  ·  Занято: ' + str(busy) + '  ·  Требуют внимания: ' + str(errors))
+        self.counter.set('Выбрано: ' + str(selected))
+        rows = cm_ui.operation_entries(self.operations.active)
+        self.task_caption.set('Текущие операции · ' + str(len(rows)))
+        if not rows:
+            rows = [('idle', ('Нет активных операций', '', 'Можно начать новую задачу'))]
+        cm_ui.sync_rows(self.task_table, [(identifier, values, ()) for identifier, values in rows])
+
+    def show_operation(self):
+        selection = self.task_table.selection()
+        operation = self.operations.active.get(selection[0]) if selection else None
+        if not operation:
+            return
+        dialog = tk.Toplevel(self.window)
+        dialog.title('Ход операции')
+        dialog.geometry('800x460')
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill='both', expand=True)
+        text = tk.Text(frame, wrap='word')
+        text.pack(side='left', fill='both', expand=True)
+        scroll = ttk.Scrollbar(frame, command=text.yview)
+        scroll.pack(side='right', fill='y')
+        text.configure(yscrollcommand=scroll.set)
+        def update():
+            if not dialog.winfo_exists():
+                return
+            data = dict(state='Выполняется' if operation['id'] in self.operations.active else 'Завершена',
+                        pending={name: self.statuses.get(name, ('Ожидание', False))[0] for name in sorted(operation['pending'])},
+                        results=operation['results'])
+            position = text.yview()[0]
+            text.configure(state='normal')
+            text.delete('1.0', 'end')
+            lines = ['Статус: ' + data['state'], '', 'Компьютеры в работе:']
+            lines.extend(name + ': ' + status for name, status in data['pending'].items())
+            if not data['pending']:
+                lines.append('Нет')
+            lines.extend(['', 'Завершившиеся компьютеры:', '', cm_ui.format_results(data['results'])])
+            text.insert('1.0', '\n'.join(lines))
+            text.configure(state='disabled')
+            text.yview_moveto(position)
+            dialog.after(500, update)
+        update()
+
+    def stop_for_host(self, name):
+        if self.busy or not name:
+            return
+        operation = self.operations.active.get(self.operations.owners.get(name), {})
+        action = operation.get('action')
+        if action not in ('distribute', 'command'):
+            return
+        previous = set(self.selected)
+        control = operation.get('controls', {}).get(name)
+        self.selected = {name}
+        try:
+            (self.cancel_distribution if action == 'distribute' else self.stop_commands)()
+        finally:
+            self.selected = previous
+            if control and (control.cancelled.is_set() or isinstance(control, CommandControl) and control.stop_requested.is_set()):
+                self.selected.discard(name)
+            self.refresh()
+        return 'break'
 
     def visible(self):
         room = self.room.get()
         return [h for h in self.hosts if room == 'Все кабинеты' or h.room == room]
 
     def refresh(self):
-        self.room_box['values'] = ['Все кабинеты'] + sorted(self.rooms)
-        self.table.delete(*self.table.get_children())
+        if hasattr(self, 'room_list'):
+            self.refresh_rooms()
+        else:
+            self.room_box['values'] = ['Все кабинеты'] + sorted(self.rooms)
+        rows = []
         for host in self.visible():
             chosen = host.name in self.selected
             status, failed = self.statuses.get(host.name, ('Не проверен', False))
             tags = (['chosen'] if chosen else []) + (['error'] if failed else [])
-            self.table.insert('', 'end', iid=host.name, values=('☑' if chosen else '☐', host.name, self.last_ips.get(host.name, 'Авто (DNS)' if host.mode == 'dns' else host.ip), status), tags=tags)
-        self.counter.set('Выбрано: ' + str(len(self.selected)) + '   •   В списке: ' + str(len(self.visible())))
+            operation = self.operations.active.get(self.operations.owners.get(host.name), {})
+            stop = 'Остановить' if operation.get('action') in ('distribute', 'command') else ''
+            rows.append((host.name, ('☑' if chosen else '☐', host.name,
+                         self.last_ips.get(host.name, 'Авто (DNS)' if host.mode == 'dns' else host.ip), status, stop), tags))
+        cm_ui.sync_rows(self.table, rows)
+        self.counter.set('Выбрано: ' + str(len(self.selected)))
+        self.refresh_dashboard()
 
     def change_room(self):
         # A hidden selection must never shut down computers from another classroom.
@@ -207,9 +414,14 @@ class Manager:
         self.refresh()
 
     def clicked(self, event):
-        if self.busy or self.table.identify_column(event.x) != '#1':
+        if self.busy:
             return
+        column = self.table.identify_column(event.x)
         name = self.table.identify_row(event.y)
+        if column == '#5':
+            return self.stop_for_host(name)
+        if column != '#1':
+            return
         if name:
             self.toggle(name)
             return 'break'
@@ -621,17 +833,24 @@ class Manager:
 
     def show_results(self):
         dialog = tk.Toplevel(self.window)
-        dialog.title('Последние результаты CM')
+        dialog.title('Результаты последней операции')
         dialog.geometry('850x550')
-        frame = ttk.Frame(dialog, padding=12)
+        frame = ttk.Frame(dialog, padding=16)
         frame.pack(fill='both', expand=True)
-        text = tk.Text(frame, wrap='word')
-        scrollbar = ttk.Scrollbar(frame, command=text.yview)
-        text.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
-        text.pack(fill='both', expand=True)
-        text.insert('1.0', json.dumps(self.last_results, ensure_ascii=False, indent=2) if self.last_results else 'Пока нет результатов действий.')
-        text.configure(state='disabled')
+        tabs = ttk.Notebook(frame)
+        tabs.pack(fill='both', expand=True)
+        for label, content in [('Результаты', cm_ui.format_results(self.last_results)),
+                               ('JSON', json.dumps(self.last_results, ensure_ascii=False, indent=2))]:
+            page = ttk.Frame(tabs)
+            tabs.add(page, text=label)
+            text = tk.Text(page, wrap='word')
+            text.pack(side='left', fill='both', expand=True)
+            scroll = ttk.Scrollbar(page, command=text.yview)
+            scroll.pack(side='right', fill='y')
+            text.configure(yscrollcommand=scroll.set)
+            text.insert('1.0', content)
+            text.configure(state='disabled')
+        cm_ui.color_widgets(dialog, self.palette)
 
     def scan_range(self):
         value = simpledialog.askstring('Найти компьютеры', 'IP, диапазон, подсеть или список через запятую. До 512 адресов.\nПример: 192.168.22.1-192.168.22.32, 192.168.201.39', parent=self.window)
@@ -785,7 +1004,12 @@ class Manager:
         for control in self.controls:
             blocked = value or (active and control in self.inventory_controls)
             control.configure(state='disabled' if blocked else 'normal')
-        self.room_box.configure(state='disabled' if value else 'readonly')
+        if hasattr(self, 'room_list'):
+            self.room_list.state(['disabled'] if value else ['!disabled'])
+        else:
+            self.room_box.configure(state='disabled' if value else 'readonly')
+        for menu, index, inventory in getattr(self, 'menu_controls', []):
+            menu.entryconfigure(index, state='disabled' if value or active and inventory else 'normal')
         self.delay_box.configure(state='disabled' if value else 'readonly')
         if value:
             self.progress.configure(mode='indeterminate', value=0, maximum=100)
@@ -1233,6 +1457,7 @@ class Manager:
                 self.set_busy(False)
             self.summary.set('Операция завершилась с ошибкой; проверьте результаты перед повтором.')
             messagebox.showerror('Ошибка', value, parent=self.window)
+        self.refresh_dashboard()
 
     def poll(self):
         if getattr(self, 'closing', False):
