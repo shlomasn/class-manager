@@ -1611,5 +1611,123 @@ class AutomaticNetworkTests(unittest.TestCase):
                         core.detect_local_networks()
 
 
+
+class WakeOnLanTests(unittest.TestCase):
+    def setUp(self):
+        from dataclasses import replace
+        self.host=core.Host('pc-01','192.168.4.10','Lab','fixed',mac='00:11:22:33:44:55',wol_broadcast='192.168.4.255')
+        self.rows=[dict(interface='LAN',ip='192.168.4.2',network='192.168.4.0/24')]
+        self.plan=core.wake_plan(self.host,self.rows)
+        self.key=dict(type='ssh-ed25519',key='key')
+        self.up=dict(ok=True,ip=self.host.ip,**self.key)
+
+    def test_packet_layout_and_invalid_mac_rejected(self):
+        self.assertEqual(core.mac_address('00-11-22-33-44-55'),'00:11:22:33:44:55')
+        packet=core.magic_packet(self.host.mac)
+        self.assertEqual(packet,b'\xff'*6+bytes.fromhex('001122334455')*16)
+        self.assertEqual(len(packet),102)
+        for value in ('00:00:00:00:00:00','ff:ff:ff:ff:ff:ff','01:11:22:33:44:55','garbage','00:11:22'):
+            with self.assertRaises(ValueError):core.mac_address(value)
+
+    def test_wake_plan_uses_exact_connected_broadcast_and_rejects_other_network(self):
+        from dataclasses import replace
+        self.assertEqual(self.plan,dict(mac=self.host.mac,broadcast='192.168.4.255',source='192.168.4.2'))
+        for host,rows in [(replace(self.host,wol_broadcast=''),self.rows),(self.host,[]),
+                          (replace(self.host,wol_broadcast='192.168.5.255'),self.rows),
+                          (self.host,self.rows+[dict(interface='VPN',ip='192.168.4.3',network='192.168.4.0/24')])]:
+            with self.assertRaises(ValueError):core.wake_plan(host,rows)
+
+    def test_mac_fields_roundtrip_and_legacy_defaults(self):
+        from dataclasses import asdict
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'inventory.json'
+            core.save_inventory(path,['Lab'],[self.host])
+            self.assertEqual(core.load_inventory(path)[1],[self.host])
+        old=core.validate_hosts([dict(name='pc-02')])[0]
+        self.assertEqual((old.mac,old.wol_broadcast),('',''))
+        with self.assertRaises(ValueError):core.validate_hosts([dict(name='pc-02',mac='ff:ff:ff:ff:ff:ff')])
+
+    def test_mac_collection_only_after_verified_connection_and_no_sudo(self):
+        client=Mock()
+        payload=json.dumps(dict(mac=self.host.mac,broadcast='192.168.4.255',prefix=24,interface='eth0'))
+        with patch.object(core,'connect_verified',return_value=client) as connect,patch.object(core,'run',return_value=(0,payload)) as run:
+            result=core.collect_mac(self.host,dict(ip=self.host.ip),'secret')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['mac'],self.host.mac)
+        connect.assert_called_once()
+        self.assertNotIn('sudo ',run.call_args.args[1])
+        self.assertIn("/wireless",run.call_args.args[1])
+        client.close.assert_called_once()
+
+    def test_mac_collection_failure_does_not_provide_unverified_metadata(self):
+        with patch.object(core,'connect_verified',side_effect=paramiko.AuthenticationException()),patch.object(core,'run') as run:
+            result=core.collect_mac(self.host,dict(ip=self.host.ip),'secret')
+        self.assertTrue(result['stop'])
+        self.assertNotIn('mac',result)
+        run.assert_not_called()
+
+    def test_wake_sends_once_then_confirms_known_key(self):
+        sender=Mock();sender.sendto.return_value=102
+        with patch.object(core,'probe',side_effect=[dict(ok=False),self.up]),patch.object(core.socket,'socket') as factory:
+            factory.return_value.__enter__.return_value=sender
+            result=core.wake_computer(self.host,self.plan,self.key)
+        self.assertTrue(result['ok']);self.assertTrue(result['sent'])
+        sender.bind.assert_called_once_with(('192.168.4.2',0))
+        sender.sendto.assert_called_once_with(core.magic_packet(self.host.mac),('192.168.4.255',9))
+
+    def test_already_online_or_changed_key_never_sends_wake(self):
+        for current,expected_ok in [(self.up,True),(dict(self.up,key='different'),False)]:
+            with patch.object(core,'probe',return_value=current),patch.object(core.socket,'socket') as factory:
+                result=core.wake_computer(self.host,self.plan,self.key)
+            self.assertEqual(result['ok'],expected_ok)
+            self.assertFalse(result['sent']);factory.assert_not_called()
+
+    def test_changed_key_after_packet_is_not_success(self):
+        with patch.object(core,'probe',side_effect=[dict(ok=False),dict(self.up,key='different')]),patch.object(core.socket,'socket') as factory:
+            factory.return_value.__enter__.return_value.sendto.return_value=102
+            result=core.wake_computer(self.host,self.plan,self.key)
+        self.assertTrue(result['sent']);self.assertFalse(result['ok'])
+        self.assertIn('другой SSH-ключ',result['message'])
+
+    def test_timeout_does_not_claim_power_on_or_retransmit(self):
+        with patch.object(core,'probe',return_value=dict(ok=False)),patch.object(core.socket,'socket') as factory,patch.object(core.time,'monotonic',side_effect=[0,1]):
+            sender=factory.return_value.__enter__.return_value;sender.sendto.return_value=102
+            result=core.wake_computer(self.host,self.plan,self.key,timeout=1)
+        self.assertFalse(result['ok']);self.assertTrue(result['sent'])
+        sender.sendto.assert_called_once()
+        self.assertIn('не подтверждено',result['message'])
+
+    def test_cancel_before_and_after_packet_preserves_uncertain_outcome(self):
+        control=core.OperationControl();control.cancel()
+        with patch.object(core.socket,'socket') as factory:
+            result=core.wake_computer(self.host,self.plan,self.key,control=control)
+        self.assertTrue(result['cancelled']);self.assertFalse(result['sent']);factory.assert_not_called()
+        def cancel(text):raise core.OperationCancelled()
+        with patch.object(core,'probe',return_value=dict(ok=False)),patch.object(core.socket,'socket') as factory:
+            factory.return_value.__enter__.return_value.sendto.return_value=102
+            result=core.wake_computer(self.host,self.plan,self.key,progress=cancel)
+        self.assertTrue(result['sent']);self.assertTrue(result['cancelled'])
+        self.assertIn('не отменяет',result['message'])
+
+
+    def test_wake_workers_start_in_parallel_and_keep_separate_controls(self):
+        import queue,threading
+        from dataclasses import replace
+        app=gui.Manager.__new__(gui.Manager)
+        hosts=[replace(self.host,name='pc-01'),replace(self.host,name='pc-02',mac='00:11:22:33:44:66')]
+        barrier=threading.Barrier(2)
+        controls={h.name:core.OperationControl() for h in hosts}
+        seen={}
+        def wake(host,plan,key,control,progress):
+            seen[host.name]=control
+            barrier.wait(timeout=3)
+            return dict(name=host.name,ok=True,sent=True,message='test')
+        with tempfile.TemporaryDirectory() as folder,patch.object(gui,'wake_computer',side_effect=wake):
+            app.data=Path(folder)
+            app.wake_worker(hosts,{h.name:self.plan for h in hosts},{h.name:self.key for h in hosts},controls,queue.Queue())
+            self.assertEqual(len(list((app.data/'reports').glob('*.json'))),1)
+        self.assertEqual(seen,controls)
+
+
 if __name__ == '__main__':
     unittest.main()

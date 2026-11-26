@@ -233,7 +233,7 @@ class WorkbenchTests(unittest.TestCase):
             field = frame.grid_slaves(row=5,column=1)[0]
             self.assertEqual(field.cget('show'), '*')
             field.insert(0,'private-test-value')
-            bar = frame.grid_slaves(row=10,column=0)[0]
+            bar = frame.grid_slaves(row=12,column=0)[0]
             next(w for w in bar.winfo_children() if w.cget('text')=='Сохранить').invoke()
         before = app.hosts[1]
         self.root.after(50,fill_and_save)
@@ -314,6 +314,57 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(len(ips),253)
         self.assertEqual(ips[0],'10.20.30.1')
         self.assertNotIn('10.20.30.10',ips)
+
+
+    def test_mac_editor_fields_save_without_touching_credentials(self):
+        app=self.app;old=app.hosts[0]
+        def save_card():
+            dialog=next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
+            frame=dialog.winfo_children()[0]
+            frame.grid_slaves(row=7,column=1)[0].insert(0,'00-11-22-33-44-55')
+            frame.grid_slaves(row=8,column=1)[0].insert(0,'192.168.22.255')
+            bar=frame.grid_slaves(row=12,column=0)[0]
+            next(w for w in bar.winfo_children() if w.cget('text')=='Сохранить').invoke()
+        self.root.after(50,save_card)
+        with patch.object(gui.credential_store,'save') as vault,patch.object(gui.messagebox,'showerror') as error:
+            app.host_editor(old)
+        error.assert_not_called();vault.assert_not_called()
+        host=next(h for h in app.hosts if h.name==old.name)
+        self.assertEqual((host.mac,host.wol_broadcast),('00:11:22:33:44:55','192.168.22.255'))
+        self.assertEqual(host.username,old.username)
+
+    def test_collected_mac_only_updates_successful_computers(self):
+        app=self.app;first,second=app.hosts[:2]
+        note=app.save_collected_macs([dict(name=first.name,action='collect_mac',ok=True,mac='00:11:22:33:44:55',wol_broadcast='192.168.22.255'),
+            dict(name=second.name,action='collect_mac',ok=False,mac='ff:ff:ff:ff:ff:ff')])
+        self.assertIn('сохранены',note)
+        self.assertIn(second,app.hosts)
+        self.assertEqual(next(h for h in core.load_inventory(app.inventory_file)[1] if h.name==first.name).mac,'00:11:22:33:44:55')
+
+    def test_wake_cancel_confirmation_sends_no_packets_and_releases_hosts(self):
+        from dataclasses import replace
+        app=self.app
+        host=replace(app.hosts[0],mac='00:11:22:33:44:55',wol_broadcast='192.168.22.255')
+        app.trusted[host.name]=dict(type='ssh-ed25519',key='key')
+        operation=app.operations.start('wake',[host],{})
+        app.preparing_operation=operation['id']
+        with patch.object(gui.messagebox,'askokcancel',return_value=False),patch.object(gui.threading,'Thread') as thread:
+            app.wake_ready([host],[dict(ip='192.168.22.2',network='192.168.22.0/24')],operation['id'])
+        thread.assert_not_called()
+        self.assertNotIn(host.name,app.operations.owners)
+
+
+    def test_stop_wake_wait_only_cancels_selected_computers(self):
+        app=self.app
+        hosts=app.hosts[:2]
+        op=app.operations.start('wake',hosts,{})
+        op['controls']={h.name:core.OperationControl() for h in hosts}
+        app.selected={hosts[0].name}
+        with patch.object(gui.messagebox,'askokcancel',return_value=True):
+            app.stop_wake_wait()
+        self.assertTrue(op['controls'][hosts[0].name].cancelled.is_set())
+        self.assertFalse(op['controls'][hosts[1].name].cancelled.is_set())
+        self.assertEqual(len(op['pending']),2)
 
 
 if __name__ == '__main__':

@@ -78,6 +78,8 @@ class Host:
     username: str = 'user'
     credential_mode: str = 'shared'
     domain: str = ''
+    mac: str = ''
+    wol_broadcast: str = ''
 
 
 def login_name(value):
@@ -184,7 +186,9 @@ def validate_hosts(rows):
         credentials = row.get('credential_mode', 'shared' if login == 'user' else 'host')
         if credentials not in ('shared', 'host') or (credentials == 'shared' and login != 'user'):
             raise ValueError('Общий пароль доступен только для user')
-        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials, dns_domain(row.get('domain', ''))))
+        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials, dns_domain(row.get('domain', '')),
+                           mac_address(row['mac']) if row.get('mac') else '',
+                           school_ip(row['wol_broadcast']) if row.get('wol_broadcast') else ''))
     return result
 
 
@@ -1217,4 +1221,123 @@ def synchronize_time(host, pin, password, progress=None, control=None, access_ga
             client.close()
             if control:
                 control.discard(client)
+    return result
+
+def mac_address(value):
+    value = value.strip().replace(':', '').replace('-', '').lower()
+    if not re.fullmatch(r'[0-9a-f]{12}', value) or int(value[:2], 16) & 1 or value == '0' * 12:
+        raise ValueError('Нужен индивидуальный MAC Ethernet: AA:BB:CC:DD:EE:FF')
+    return ':'.join(value[index:index + 2] for index in range(0, 12, 2))
+
+
+def magic_packet(mac):
+    return b'\xff' * 6 + bytes.fromhex(mac_address(mac).replace(':', '')) * 16
+
+
+def wake_plan(host, networks):
+    mac = mac_address(host.mac)
+    if not host.wol_broadcast:
+        raise ValueError(host.name + ': сначала получите MAC и адрес рассылки или задайте их в карточке ПК')
+    broadcast = school_ip(host.wol_broadcast)
+    matches = [row for row in networks if str(ipaddress.IPv4Network(row['network']).broadcast_address) == broadcast
+               and ipaddress.IPv4Network(row['network']).prefixlen <= 30]
+    sources = {row['ip'] for row in matches}
+    if len(sources) != 1:
+        raise ValueError(host.name + ': сеть WoL не подключена к учителю или подходит несколько интерфейсов; проверьте подключение и адрес рассылки')
+    return dict(mac=mac, broadcast=broadcast, source=next(iter(sources)))
+
+
+def collect_mac(host, pin, password, control=None, access_gate=None):
+    result = dict(name=host.name, ip=pin['ip'], action='collect_mac', ok=False)
+    client = None
+    try:
+        if access_gate:
+            client = access_gate.connect(host, pin, password, control)
+        else:
+            client = connect_verified(host, pin, password, control)
+        script = r'''import ipaddress,json,os,shutil,subprocess,sys
+ip=sys.argv[1]
+tool=shutil.which('ip') or next((p for p in ('/usr/sbin/ip','/sbin/ip') if os.path.exists(p)),None)
+if not tool: raise SystemExit('Нужен пакет iproute2')
+rows=json.loads(subprocess.check_output([tool,'-j','-4','address','show'],timeout=8))
+found=[]
+for row in rows:
+    name=row['ifname']
+    base='/sys/class/net/'+name
+    if not os.path.exists(base+'/device') or os.path.exists(base+'/wireless'):
+        continue
+    for addr in row.get('addr_info',[]):
+        if addr.get('family')=='inet' and addr.get('local')==ip:
+            prefix=addr['prefixlen']
+            net=ipaddress.IPv4Network(ip+'/'+str(prefix),strict=False)
+            found.append(dict(mac=row['address'],interface=name,broadcast=str(net.broadcast_address),prefix=prefix))
+if len(found)!=1:
+    raise SystemExit('Не найден однозначный проводной адаптер подключения SSH; используйте проводное подключение или задайте MAC вручную')
+print(json.dumps(found[0]))
+'''
+        command = 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(school_ip(pin['ip']))
+        code, output = run(client, command, timeout=15, **(dict(control=control) if control else {}))
+        if code:
+            raise RuntimeError('Не удалось получить MAC проводного адаптера: ' + output[:300])
+        value = json.loads(output)
+        mac = mac_address(value['mac'])
+        prefix = value['prefix']
+        if type(prefix) is not int or not 8 <= prefix <= 30:
+            raise ValueError('Для WoL нужна обычная локальная подсеть с адресом рассылки')
+        net = ipaddress.IPv4Network(pin['ip'] + '/' + str(prefix), strict=False)
+        if not any(net.subnet_of(ipaddress.ip_network(private)) for private in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16')) or str(net.broadcast_address) != value['broadcast']:
+            raise ValueError('Не подтверждён локальный адрес рассылки')
+        result.update(ok=True, mac=mac, wol_broadcast=value['broadcast'], interface=value['interface'],
+                      message='MAC получен: ' + mac + ', рассылка ' + value['broadcast'])
+    except Exception as error:
+        operation_error(result, error, password)
+        if result.get('stop') and access_gate:
+            access_gate.stopped.set()
+    finally:
+        if client:
+            client.close()
+            if control: control.discard(client)
+    return result
+
+
+def wake_computer(host, plan, expected_key, control=None, progress=None, timeout=180):
+    result = dict(name=host.name, ip='', action='wake', ok=False, sent=False)
+    try:
+        if not expected_key:
+            raise ValueError('Нет доверенного SSH-ключа: сначала получите MAC на включённом ПК')
+        if control: control.check()
+        before = probe(host, control=control)
+        if before.get('ok'):
+            if not same_key(before, expected_key):
+                raise RuntimeError('SSH-ключ изменился; включение не отправлялось')
+            result.update(ok=True, ip=before['ip'], message='ПК уже доступен по SSH, ключ проверен; пакет WoL не отправлялся')
+            return result
+        if control: control.check()
+        # One packet only: no automatic retransmission or router configuration.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sender.bind((school_ip(plan['source']), 0))
+            count = sender.sendto(magic_packet(plan['mac']), (school_ip(plan['broadcast']), 9))
+            if count != 102: raise RuntimeError('Пакет WoL отправлен не полностью')
+        result['sent'] = True
+        started = time.monotonic()
+        while time.monotonic() - started < timeout:
+            if control: control.check()
+            if progress:
+                progress('Запрос включения отправлен; ожидание SSH ' + str(int(time.monotonic() - started)) + '/' + str(timeout) + ' с')
+            current = probe(host, control=control)
+            if current.get('ok'):
+                if not same_key(current, expected_key):
+                    raise RuntimeError('После WoL обнаружен другой SSH-ключ; появление нужного ПК не подтверждено')
+                result.update(ok=True, ip=current['ip'], message='После запроса WoL появился SSH с доверенным ключом')
+                return result
+            pause_until = min(started + timeout, time.monotonic() + 3)
+            while time.monotonic() < pause_until:
+                if control: control.check()
+                time.sleep(.2)
+        result['message'] = 'Запрос WoL отправлен; появление ПК за отведённое время не подтверждено. Автоповтора нет'
+    except OperationCancelled:
+        result.update(cancelled=True, message='Ожидание остановлено; уже отправленный WoL не отменяет включение' if result['sent'] else 'Включение отменено до отправки')
+    except Exception as error:
+        result['message'] = str(error)
     return result

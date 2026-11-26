@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan, mac_address, wake_plan, collect_mac, wake_computer
 import credential_store
 import cm_ui
 
@@ -115,7 +115,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.4 — управление школьными компьютерами')
+        window.title('CM Astra 2.5 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -170,7 +170,7 @@ class Manager:
         menu.add_cascade(label='Компьютеры', menu=computers)
         for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
                               ('Удалить отмеченные ПК…', self.remove_hosts), ('Перенести отмеченные в кабинет…', self.move_hosts),
-                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Найти ПК в моей сети…', self.scan_local_network), ('Найти ПК по IP…', self.scan_range)]:
+                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Получить MAC выбранных ПК…', lambda: self.begin('collect_mac')), ('Найти ПК в моей сети…', self.scan_local_network), ('Найти ПК по IP…', self.scan_range)]:
             self.menu_action(computers, text, command, inventory=True)
         rooms = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Кабинеты', menu=rooms)
@@ -189,7 +189,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.4 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.5 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -219,6 +219,7 @@ class Manager:
         self.controls.append(power)
         power_menu = tk.Menu(power, tearoff=False)
         power.configure(menu=power_menu)
+        self.menu_action(power_menu, 'Включить выбранные ПК…', lambda: self.begin('wake'))
         self.menu_action(power_menu, 'Выключить…', lambda: self.begin('off'))
         self.menu_action(power_menu, 'Перезагрузить…', lambda: self.begin('reboot'))
         self.menu_action(power_menu, 'Отменить запланированное выключение / перезагрузку…', lambda: self.begin('cancel'))
@@ -229,6 +230,7 @@ class Manager:
         stopping.configure(menu=stop_menu)
         self.menu_action(stop_menu, 'Отменить раздачу выбранным', self.cancel_distribution)
         self.menu_action(stop_menu, 'Остановить команды выбранным…', self.stop_commands)
+        self.menu_action(stop_menu, 'Остановить ожидание включения выбранным…', self.stop_wake_wait)
 
         selection = ttk.Frame(main)
         selection.grid(row=3, column=0, sticky='ew', pady=(0, 8))
@@ -392,13 +394,13 @@ class Manager:
             return
         operation = self.operations.active.get(self.operations.owners.get(name), {})
         action = operation.get('action')
-        if action not in ('distribute', 'command'):
+        if action not in ('distribute', 'command', 'wake'):
             return
         previous = set(self.selected)
         control = operation.get('controls', {}).get(name)
         self.selected = {name}
         try:
-            (self.cancel_distribution if action == 'distribute' else self.stop_commands)()
+            (self.cancel_distribution if action == 'distribute' else self.stop_wake_wait if action == 'wake' else self.stop_commands)()
         finally:
             self.selected = previous
             if control and (control.cancelled.is_set() or isinstance(control, CommandControl) and control.stop_requested.is_set()):
@@ -421,7 +423,7 @@ class Manager:
             status, failed = self.statuses.get(host.name, ('Не проверен', False))
             tags = (['chosen'] if chosen else []) + (['error'] if failed else [])
             operation = self.operations.active.get(self.operations.owners.get(host.name), {})
-            stop = 'Остановить' if operation.get('action') in ('distribute', 'command') else ''
+            stop = 'Остановить' if operation.get('action') in ('distribute', 'command', 'wake') else ''
             rows.append((host.name, ('☑' if chosen else '☐', host.name,
                          self.last_ips.get(host.name, 'Авто (DNS)' if host.mode == 'dns' else host.ip), status, stop), tags))
         cm_ui.sync_rows(self.table, rows)
@@ -454,7 +456,7 @@ class Manager:
     def toggle(self, name):
         owners = getattr(getattr(self, 'operations', None), 'owners', {})
         operation = getattr(getattr(self, 'operations', None), 'active', {}).get(owners.get(name), {})
-        if name in owners and name not in self.selected and operation.get('action') not in ('distribute', 'command'):
+        if name in owners and name not in self.selected and operation.get('action') not in ('distribute', 'command', 'wake'):
             messagebox.showinfo('Компьютер занят', name + ': дождитесь окончания его операции или выберите другой ПК.', parent=self.window)
             return
         if name in self.selected:
@@ -611,6 +613,8 @@ class Manager:
         password = tk.StringVar()
         credentials = tk.StringVar(value='Общий user' if not original or original.credential_mode == 'shared' else 'Для этого ПК')
         erase = tk.BooleanVar(value=False)
+        mac = tk.StringVar(value=original.mac if original else '')
+        broadcast = tk.StringVar(value=original.wol_broadcast if original else '')
         for row, (label, widget) in enumerate([
             ('Имя ПК:', ttk.Entry(frame, textvariable=name, width=42)),
             ('Класс:', ttk.Combobox(frame, textvariable=room, values=sorted(self.rooms), state='readonly', width=39)),
@@ -618,7 +622,9 @@ class Manager:
             ('Постоянный IP:', ttk.Entry(frame, textvariable=ip, width=42)),
             ('Логин SSH:', ttk.Entry(frame, textvariable=username, width=42)),
             ('Пароль:', ttk.Entry(frame, textvariable=password, show='*', width=42)),
-            ('Учётная запись:', ttk.Combobox(frame, textvariable=credentials, values=('Общий user', 'Для этого ПК'), state='readonly', width=39))]):
+            ('Учётная запись:', ttk.Combobox(frame, textvariable=credentials, values=('Общий user', 'Для этого ПК'), state='readonly', width=39)),
+            ('MAC Ethernet (WoL):', ttk.Entry(frame, textvariable=mac, width=42)),
+            ('Адрес рассылки WoL:', ttk.Entry(frame, textvariable=broadcast, width=42))]):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
             widget.grid(row=row, column=1, sticky='ew', pady=6)
             if row == 0:
@@ -629,13 +635,13 @@ class Manager:
             ip_entry.configure(state='disabled' if mode.get().startswith('По имени') else 'normal')
         frame.grid_slaves(row=2, column=1)[0].bind('<<ComboboxSelected>>', mode_changed)
         mode_changed()
-        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя через настройки сети компьютера учителя.').grid(row=7, columnspan=2, sticky='w', pady=12)
-        ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=8, columnspan=2, sticky='w')
-        ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=9, columnspan=2, sticky='w', pady=8)
+        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя через настройки сети компьютера учителя.').grid(row=9, columnspan=2, sticky='w', pady=12)
+        ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=10, columnspan=2, sticky='w')
+        ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=11, columnspan=2, sticky='w', pady=8)
         def save():
             try:
                 dns = mode.get().startswith('По имени')
-                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain)
+                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain, mac=mac.get(), wol_broadcast=broadcast.get())
                 rows = [asdict(h) for h in self.hosts if original is None or h.name != original.name]
                 rows.append(candidate)
                 hosts = validate_hosts(rows)
@@ -657,7 +663,7 @@ class Manager:
             except Exception as error:
                 messagebox.showerror('Компьютер не сохранён', str(error), parent=dialog)
         bar = ttk.Frame(frame)
-        bar.grid(row=10, columnspan=2, sticky='ew')
+        bar.grid(row=12, columnspan=2, sticky='ew')
         ttk.Button(bar, text='Сохранить', command=save).pack(side='left')
         ttk.Button(bar, text='Отмена', command=dialog.destroy).pack(side='right')
         dialog.grab_set()
@@ -1224,6 +1230,89 @@ class Manager:
         elif not active:
             self.progress.stop()
 
+    def stop_wake_wait(self):
+        targets = [(op, name) for op in self.operations.active.values() if op['action'] == 'wake'
+                   for name in op['pending'] if name in self.selected]
+        if not targets:
+            return
+        if messagebox.askokcancel('Остановить ожидание включения', 'Прекратить проверку выбранных ПК? Уже отправленные пакеты WoL не отменяются.', default='cancel', parent=self.window):
+            for op, name in targets:
+                op['controls'][name].cancel()
+                self.statuses[name] = ('Остановка ожидания включения…', False)
+            self.refresh()
+
+    def prepare_wake(self, hosts, events):
+        try:
+            events.put(('wake_ready', (hosts, detect_local_networks())))
+        except Exception as error:
+            events.put(('error', str(error)))
+
+    def wake_ready(self, hosts, networks, identifier):
+        operation = self.operations.active[identifier]
+        try:
+            if len({mac_address(host.mac) for host in hosts}) != len(hosts):
+                raise ValueError('У выбранных ПК повторяется MAC: проверьте карточки')
+            plans = {host.name: wake_plan(host, networks) for host in hosts}
+            keys = {host.name: dict(self.trusted.get(host.name) or self.catalog.get(host.name) or {}) for host in hosts}
+            missing = [host.name for host in hosts if not keys[host.name]]
+            if missing:
+                raise ValueError('Сначала получите MAC по SSH на включённых ПК (нужен доверенный ключ): ' + ', '.join(missing))
+        except ValueError as error:
+            self.finish_operation(identifier)
+            messagebox.showerror('Включение не подготовлено', str(error), parent=self.window)
+            return
+        details = '\n'.join(host.name + ' · ' + plans[host.name]['mac'] + ' → ' + plans[host.name]['broadcast'] + ' (с ' + plans[host.name]['source'] + ')' for host in hosts)
+        if not messagebox.askokcancel('Включить выбранные ПК', details + '\n\nОтправить Wake-on-LAN и до 180 секунд проверять появление SSH с доверенным ключом?\nНужны проводная сеть, питание и заранее включённый WoL в BIOS/ОС. Пакет не гарантирует включение. Автоповтора нет.', default='cancel', parent=self.window):
+            self.finish_operation(identifier)
+            return
+        operation['state'] = 'running'
+        operation['job'] = dict(plans=plans, keys=keys)
+        self.preparing_operation = None
+        self.selected.difference_update(host.name for host in hosts)
+        self.set_busy(False)
+        self.refresh()
+        self.update_activity()
+        events = OperationEvents(self.events, identifier)
+        threading.Thread(target=self.wake_worker, args=(hosts, plans, keys, operation['controls'], events), daemon=True).start()
+
+    def wake_worker(self, hosts, plans, keys, controls, events):
+        try:
+            def worker(host):
+                result = wake_computer(host, plans[host.name], keys[host.name], control=controls[host.name],
+                    progress=lambda text: events.put(('wake_progress', dict(name=host.name, text=text))))
+                events.put(('result', result))
+                return result
+            with ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+                results = list(pool.map(worker, hosts))
+            report = self.data / 'reports' / ('wake-' + uuid.uuid4().hex + '.json')
+            atomic_json(report, results)
+            events.put(('finished', (results, str(report))))
+        except Exception as error:
+            events.put(('error', str(error)))
+
+    def send_mac(self, host_map, rows, passwords, events, control):
+        gate = TransferAccessGate(control)
+        def worker(pin):
+            host = host_map[pin['name']]
+            result = collect_mac(host, pin, password_for(passwords, host.name), control=control, access_gate=gate)
+            events.put(('result', result))
+            return result
+        with ThreadPoolExecutor(max_workers=len(rows)) as pool:
+            return list(pool.map(worker, rows))
+
+    def save_collected_macs(self, results):
+        values = {row['name']: row for row in results if row.get('action') == 'collect_mac' and row.get('ok')}
+        if not values:
+            return ''
+        try:
+            hosts = [replace(host, mac=values[host.name]['mac'], wol_broadcast=values[host.name]['wol_broadcast']) if host.name in values else host for host in self.hosts]
+            save_inventory(self.inventory_file, self.rooms, hosts)
+            self.hosts = hosts
+            return ' MAC и адреса рассылки сохранены.'
+        except Exception:
+            messagebox.showerror('MAC не сохранены', 'MAC получены, но записать список не удалось. Проверьте доступ к файлу настроек и повторите получение MAC.', parent=self.window)
+            return ' Внимание: MAC получены, но не сохранены.'
+
     def begin(self, action, job=None):
         hosts = [h for h in self.visible() if h.name in self.selected]
         if not hosts:
@@ -1246,9 +1335,13 @@ class Manager:
             operation['controls'] = {host.name: OperationControl(parent=self.shutdown) for host in hosts}
         self.preparing_operation = operation['id']
         self.set_busy(True)
-        self.summary.set('Проверка SSH без пароля…')
+        self.summary.set('Подготовка включения…' if action == 'wake' else 'Проверка SSH без пароля…')
         events = OperationEvents(self.events, operation['id'])
-        threading.Thread(target=self.discover, args=(hosts, action, minutes, events, self.shutdown), daemon=True).start()
+        if action == 'wake':
+            operation['controls'] = {host.name: OperationControl(parent=self.shutdown) for host in hosts}
+            threading.Thread(target=self.prepare_wake, args=(hosts, events), daemon=True).start()
+        else:
+            threading.Thread(target=self.discover, args=(hosts, action, minutes, events, self.shutdown), daemon=True).start()
 
     def finish_operation(self, identifier):
         self.operations.finish(identifier)
@@ -1337,7 +1430,7 @@ class Manager:
                 self.trusted[row['name']] = {k: row[k] for k in ('type', 'key', 'fingerprint', 'name')}
             atomic_json(self.trust_file, self.trusted)
         names = ', '.join(row['name'] for row in permitted)
-        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на', 'time_sync': 'Синхронизировать время на'}[action]
+        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на', 'time_sync': 'Синхронизировать время на', 'collect_mac': 'Получить MAC проводного подключения на'}[action]
         text = verb + ' ' + str(len(permitted)) + (' компьютерах?' if action == 'cancel' else ' компьютеров?') + '\n\n' + names
         if action == 'time_sync':
             now = datetime.datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z (UTC%z)')
@@ -1559,7 +1652,9 @@ class Manager:
                 results.extend(self.send_commands(host_map, rows, password, job, events, control, host_controls))
             if action == 'time_sync':
                 results.extend(self.send_time_sync(host_map, rows, password, events, control, host_controls))
-            for index, pin in enumerate([] if action in ('distribute', 'command', 'time_sync') else rows):
+            if action == 'collect_mac':
+                results.extend(self.send_mac(host_map, rows, password, events, control))
+            for index, pin in enumerate([] if action in ('distribute', 'command', 'time_sync', 'collect_mac') else rows):
                 if control:
                     control.check()
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
@@ -1591,7 +1686,7 @@ class Manager:
             target_control = operation.get('controls', {}).get(value['name'])
             if target_control and target_control.cancelled.is_set():
                 return
-        if operation_id and kind in ('result', 'command_progress', 'distribution_progress'):
+        if operation_id and kind in ('result', 'command_progress', 'distribution_progress', 'wake_progress'):
             if self.operations.owners.get(value['name']) != operation_id:
                 return  # Late events cannot replace a newer operation's row.
         progress_state = operation['progress'] if operation else getattr(self, 'distribution_state', {})
@@ -1600,7 +1695,12 @@ class Manager:
                 self.update_activity()
             else:
                 self.update_distribution_summary()
-        if kind == 'discovered':
+        if kind == 'wake_ready':
+            self.wake_ready(*value, operation_id)
+        elif kind == 'wake_progress':
+            self.statuses[value['name']] = (value['text'], False)
+            self.refresh()
+        elif kind == 'discovered':
             self.discovered(*value, operation_id=operation_id) if operation_id else self.discovered(*value)
         elif kind == 'result':
             if value.get('action') in ('upload', 'download') and value['name'] in progress_state:
@@ -1618,13 +1718,14 @@ class Manager:
         elif kind == 'finished':
             results, report = value
             self.last_results = results
+            mac_note = self.save_collected_macs(results)
             good = sum(r['ok'] for r in results)
             cancelled = sum(bool(r.get('cancelled')) for r in results)
             if operation_id:
                 self.finish_operation(operation_id)
             else:
                 self.set_busy(False)
-            self.summary.set('Готово: успешно ' + str(good) + ', отменено ' + str(cancelled) + ', ошибок/пропусков ' + str(len(results) - good - cancelled) + '. Отчёт: ' + report)
+            self.summary.set('Готово: успешно ' + str(good) + ', отменено ' + str(cancelled) + ', ошибок/пропусков ' + str(len(results) - good - cancelled) + '. Отчёт: ' + report + mac_note)
             if operation_id and self.operations.active:
                 self.update_activity()
         elif kind == 'command_waiting':
@@ -1738,7 +1839,7 @@ class Manager:
         active = getattr(getattr(self, 'operations', None), 'active', {})
         if active or self.busy:
             titles = {'distribute': 'Раздача файлов', 'command': 'Выполнение команды',
-                      'off': 'Выключение', 'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи', 'time_sync': 'Синхронизация времени'}
+                      'off': 'Выключение', 'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи', 'time_sync': 'Синхронизация времени', 'wake': 'Включение WoL', 'collect_mac': 'Получение MAC'}
             details = []
             for operation in active.values():
                 names = sorted(operation['pending'])

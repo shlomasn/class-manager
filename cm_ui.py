@@ -131,7 +131,7 @@ def room_entries(rooms, hosts):
 
 def operation_entries(operations):
     titles = {'distribute': 'Раздача файлов', 'command': 'Команда Bash', 'off': 'Выключение',
-              'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи', 'time_sync': 'Синхронизация времени'}
+              'reboot': 'Перезагрузка', 'cancel': 'Отмена выключения', 'scan': 'Проверка связи', 'time_sync': 'Синхронизация времени', 'wake': 'Включение WoL', 'collect_mac': 'Получение MAC'}
     rows = []
     for identifier, operation in operations.items():
         title = titles.get(operation['action'], operation['action'])
