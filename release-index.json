@@ -110,5 +110,13 @@
     "archive": "CM-Astra-2.5.zip",
     "sha256": "da6253ecc87af34bb863f7690fb292d79fdf90252cfd63377f645256d08d1cbf",
     "bytes": 102659
+  },
+  {
+    "version": "2.6",
+    "tag": "v2.6",
+    "commit": "b1f3433a3eea5189f02e08d938968ea90d8d03eb",
+    "archive": "CM-Astra-2.6.zip",
+    "sha256": "6b7f04e2797fed1a92b9a1b9b9c6f2481277c8208e8f9e3e9128a171785d9ade",
+    "bytes": 105411
   }
 ]
