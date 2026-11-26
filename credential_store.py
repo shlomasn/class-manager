@@ -15,6 +15,7 @@ MAX_BLOB = 2560
 def target_name(username='user', host=None):
     if host is None and username == 'user':
         return TARGET  # Preserve the existing shared credential without migration.
+    # Scope the entry to a host and login without tying it to a DHCP address.
     identity = ((host or '') + '\0' + username).encode('utf-8')
     return 'CM-Astra/SSH/host/' + hashlib.sha256(identity).hexdigest()
 
@@ -109,6 +110,7 @@ def _secret(action, password=None, username='user', host=None):
     if host is not None:
         command += ['host', host]
     try:
+        # Only lookup attributes go in process arguments. Pass the secret through stdin.
         result = subprocess.run(command, input=password if password is not None else None,
                                 capture_output=True, text=True, encoding='utf-8', timeout=60)
     except subprocess.TimeoutExpired:

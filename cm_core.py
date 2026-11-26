@@ -35,6 +35,7 @@ class OperationControl:
         if self.parent:
             self.parent.check()
 
+    # Register at both levels so app shutdown closes all sessions while a host stop stays local.
     def add(self, client):
         if self.parent:
             self.parent.add(client)
@@ -373,6 +374,7 @@ def execute(host, pin, password, action, minutes, control=None):
     try:
         if control:
             control.add(client)
+        # Pin the probed key before authenticating, in case the endpoint at this IP has changed.
         key = decode_key(pin)
         client.get_host_keys().add(ip, pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
@@ -623,6 +625,7 @@ def run_managed(client, command, token, password, timeout, control, on_progress=
         while time.monotonic() < deadline:
             control.check_connection()
             now = time.monotonic()
+            # Keep SSH open so the supervisor can signal the Bash group and report the outcome.
             if control.stop_requested.is_set() and not sent_stop:
                 channel.sendall(('CM_STOP_' + token + '\n').encode('ascii'))
                 sent_stop = True
@@ -837,6 +840,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
                 after = source.stat()
                 if local_hash != remote_hash or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                     raise RuntimeError('Файл изменился или контрольная сумма не совпала: ' + source.name)
+                # Publish the final name after verifying the temporary copy. Replacing an
+                # existing file requires a fresh destination check and atomic rename.
                 if overwrite:
                     current = sftp.lstat(target)
                     if not stat.S_ISREG(current.st_mode) or (current.st_size, current.st_mtime) != (existing.st_size, existing.st_mtime):
@@ -1059,6 +1064,8 @@ class TransferAccessGate:
     def connect(self, host, pin, password, control=None):
         import paramiko
         effective = control or self.control
+        # Serialize logins so authentication failures can stop queued attempts.
+        # Workers can continue independently once connected.
         while not self.lock.acquire(timeout=.2):
             self.check()
             if effective:
@@ -1244,6 +1251,7 @@ def wake_plan(host, networks):
     broadcast = school_ip(host.wol_broadcast)
     matches = [row for row in networks if str(ipaddress.IPv4Network(row['network']).broadcast_address) == broadcast
                and ipaddress.IPv4Network(row['network']).prefixlen <= 30]
+    # Bind to the teacher interface matching the broadcast. Reject ambiguous matches.
     sources = {row['ip'] for row in matches}
     if len(sources) != 1:
         raise ValueError(host.name + ': сеть WoL не подключена к учителю или подходит несколько интерфейсов; проверьте подключение и адрес рассылки')
@@ -1343,6 +1351,7 @@ def wake_computer(host, plan, expected_key, control=None, progress=None, timeout
             count = sender.sendto(magic_packet(plan['mac']), (school_ip(plan['broadcast']), 9))
             if count != 102: raise RuntimeError('Пакет WoL отправлен не полностью')
         result['sent'] = True
+        # UDP send confirms local submission. The pinned SSH key identifies the expected PC.
         started = time.monotonic()
         while time.monotonic() - started < timeout:
             if control: control.check()

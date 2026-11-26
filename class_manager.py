@@ -60,6 +60,7 @@ class OperationBook:
         operation = self.active.get(identifier)
         if operation:
             operation['pending'].discard(name)
+        # A PC can be reused before the rest of its original batch finishes.
         if self.owners.get(name) == identifier:
             del self.owners[name]
 
@@ -71,6 +72,7 @@ class OperationBook:
             del self.active[identifier]
 
 
+# Workers send events through the queue. Only the Tk thread applies them to widgets.
 class OperationEvents:
     def __init__(self, queue, identifier):
         self.queue, self.identifier = queue, identifier
@@ -432,6 +434,7 @@ class Manager:
             stop = 'Остановить' if operation.get('action') in ('distribute', 'command', 'wake') else ''
             rows.append((host.name, ('☑' if chosen else '☐', host.name,
                          self.last_ips.get(host.name, 'Авто (DNS)' if host.mode == 'dns' else host.ip), status, stop), tags))
+        # Sort the view only. Selection and operation ownership use stable host names.
         cm_ui.sync_rows(self.table, cm_ui.sorted_computer_rows(rows, self.sort_column, self.sort_reverse))
         self.counter.set('Выбрано: ' + str(len(self.selected)))
         self.refresh_dashboard()
@@ -1356,6 +1359,7 @@ class Manager:
             operation['controls'] = {host.name: CommandControl(parent=self.shutdown) for host in hosts}
         elif action == 'time_sync':
             operation['controls'] = {host.name: OperationControl(parent=self.shutdown) for host in hosts}
+        # Reserve hosts before discovery. After confirmation, unrelated free PCs can start another job.
         self.preparing_operation = operation['id']
         self.set_busy(True)
         self.summary.set('Подготовка включения…' if action == 'wake' else 'Проверка SSH без пароля…')
@@ -1434,6 +1438,7 @@ class Manager:
             for result in initial_results:
                 self.operations.release(operation_id, result['name'])
         self.refresh()
+        # A link check stops after the SSH handshake. It neither authenticates nor records new trust.
         if action == 'scan':
             finish()
             self.summary.set('Проверка завершена. SSH доступен: ' + str(len(permitted)) + ' из ' + str(len(rows)) + '. Команды питания не отправлялись.')
