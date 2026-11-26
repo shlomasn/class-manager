@@ -367,5 +367,25 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(len(op['pending']),2)
 
 
+    def test_wifi_mac_saved_and_shown_as_wifi_in_editor(self):
+        app=self.app;old=app.hosts[0]
+        app.save_collected_macs([dict(name=old.name,action='collect_mac',ok=True,mac='02:11:22:33:44:66',wol_broadcast='192.168.22.255',mac_type='wifi',interface='wlan0')])
+        host=next(h for h in app.hosts if h.name==old.name)
+        self.assertEqual((host.mac_type,host.mac_interface),('wifi','wlan0'))
+        seen=[]
+        def inspect_card():
+            dialog=next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
+            def widgets(parent):
+                for w in parent.winfo_children():
+                    yield w
+                    yield from widgets(w)
+            labels=[w.cget('text') for w in widgets(dialog) if isinstance(w,ttk.Label)]
+            seen.extend(labels)
+            dialog.destroy()
+        self.root.after(50,inspect_card)
+        app.host_editor(host)
+        self.assertTrue(any('Wi-Fi' in str(text) and 'wlan0' in str(text) for text in seen))
+
+
 if __name__ == '__main__':
     unittest.main()

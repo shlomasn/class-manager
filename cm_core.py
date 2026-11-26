@@ -80,6 +80,8 @@ class Host:
     domain: str = ''
     mac: str = ''
     wol_broadcast: str = ''
+    mac_type: str = ''
+    mac_interface: str = ''
 
 
 def login_name(value):
@@ -186,9 +188,13 @@ def validate_hosts(rows):
         credentials = row.get('credential_mode', 'shared' if login == 'user' else 'host')
         if credentials not in ('shared', 'host') or (credentials == 'shared' and login != 'user'):
             raise ValueError('Общий пароль доступен только для user')
+        kind = row.get('mac_type', '')
+        interface = row.get('mac_interface', '')
+        if kind not in ('', 'manual', 'ethernet', 'wifi') or not isinstance(interface, str) or len(interface) > 64 or any(ord(c) < 32 for c in interface):
+            raise ValueError('Некорректный тип или имя MAC-адаптера')
         result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials, dns_domain(row.get('domain', '')),
                            mac_address(row['mac']) if row.get('mac') else '',
-                           school_ip(row['wol_broadcast']) if row.get('wol_broadcast') else ''))
+                           school_ip(row['wol_broadcast']) if row.get('wol_broadcast') else '', kind, interface))
     return result
 
 
@@ -1247,6 +1253,39 @@ def wake_plan(host, networks):
     return dict(mac=mac, broadcast=broadcast, source=next(iter(sources)))
 
 
+def mac_collection_script():
+    """Read the address from sysfs: ip -j -4 may omit the link-level address."""
+    return r'''import ipaddress,json,os,shutil,subprocess,sys
+ip=sys.argv[1]
+tool=shutil.which('ip') or next((p for p in ('/usr/sbin/ip','/sbin/ip') if os.path.exists(p)),None)
+if not tool: raise SystemExit('Нужен пакет iproute2')
+try:
+    rows=json.loads(subprocess.check_output([tool,'-j','-4','address','show'],timeout=8))
+    found=[]
+    for row in rows:
+        name=row.get('ifname','')
+        if not name or '/' in name or name in ('.','..','lo'):
+            continue
+        base='/sys/class/net/'+name
+        wifi=os.path.exists(base+'/wireless') or os.path.exists(base+'/phy80211')
+        for addr in row.get('addr_info',[]):
+            if addr.get('family')!='inet' or addr.get('local')!=ip:
+                continue
+            if not wifi and not os.path.exists(base+'/device'):
+                raise SystemExit('IP подключения принадлежит виртуальному адаптеру; задайте нужный MAC вручную')
+            prefix=addr['prefixlen']
+            net=ipaddress.IPv4Network(ip+'/'+str(prefix),strict=False)
+            with open(base+'/address',encoding='ascii') as stream:
+                mac=stream.read().strip()
+            found.append(dict(mac=mac,interface=name,mac_type='wifi' if wifi else 'ethernet',broadcast=str(net.broadcast_address),prefix=prefix))
+    if len(found)!=1:
+        raise SystemExit('Не найден единственный адаптер с IP подключения SSH; проверьте адрес компьютера')
+    print(json.dumps(found[0]))
+except (OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
+    raise SystemExit('Не удалось прочитать MAC адаптера: '+str(error))
+'''
+
+
 def collect_mac(host, pin, password, control=None, access_gate=None):
     result = dict(name=host.name, ip=pin['ip'], action='collect_mac', ok=False)
     client = None
@@ -1255,30 +1294,14 @@ def collect_mac(host, pin, password, control=None, access_gate=None):
             client = access_gate.connect(host, pin, password, control)
         else:
             client = connect_verified(host, pin, password, control)
-        script = r'''import ipaddress,json,os,shutil,subprocess,sys
-ip=sys.argv[1]
-tool=shutil.which('ip') or next((p for p in ('/usr/sbin/ip','/sbin/ip') if os.path.exists(p)),None)
-if not tool: raise SystemExit('Нужен пакет iproute2')
-rows=json.loads(subprocess.check_output([tool,'-j','-4','address','show'],timeout=8))
-found=[]
-for row in rows:
-    name=row['ifname']
-    base='/sys/class/net/'+name
-    if not os.path.exists(base+'/device') or os.path.exists(base+'/wireless'):
-        continue
-    for addr in row.get('addr_info',[]):
-        if addr.get('family')=='inet' and addr.get('local')==ip:
-            prefix=addr['prefixlen']
-            net=ipaddress.IPv4Network(ip+'/'+str(prefix),strict=False)
-            found.append(dict(mac=row['address'],interface=name,broadcast=str(net.broadcast_address),prefix=prefix))
-if len(found)!=1:
-    raise SystemExit('Не найден однозначный проводной адаптер подключения SSH; используйте проводное подключение или задайте MAC вручную')
-print(json.dumps(found[0]))
-'''
+        script = mac_collection_script()
         command = 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(school_ip(pin['ip']))
         code, output = run(client, command, timeout=15, **(dict(control=control) if control else {}))
         if code:
-            raise RuntimeError('Не удалось получить MAC проводного адаптера: ' + output[:300])
+            safe_output = output.replace(password, '[СКРЫТО]')
+            result['diagnostic'] = safe_output[:4096]
+            detail = next((line.strip() for line in reversed(safe_output.splitlines()) if line.strip()), 'нет ответа')
+            raise RuntimeError('Не удалось получить MAC: ' + detail[:220])
         value = json.loads(output)
         mac = mac_address(value['mac'])
         prefix = value['prefix']
@@ -1287,8 +1310,11 @@ print(json.dumps(found[0]))
         net = ipaddress.IPv4Network(pin['ip'] + '/' + str(prefix), strict=False)
         if not any(net.subnet_of(ipaddress.ip_network(private)) for private in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16')) or str(net.broadcast_address) != value['broadcast']:
             raise ValueError('Не подтверждён локальный адрес рассылки')
-        result.update(ok=True, mac=mac, wol_broadcast=value['broadcast'], interface=value['interface'],
-                      message='MAC получен: ' + mac + ', рассылка ' + value['broadcast'])
+        kind = value.get('mac_type', 'ethernet')
+        if kind not in ('ethernet', 'wifi'):
+            raise ValueError('Неизвестный тип адаптера')
+        result.update(ok=True, mac=mac, wol_broadcast=value['broadcast'], interface=value['interface'], mac_type=kind,
+                      message='MAC ' + ('Wi-Fi' if kind == 'wifi' else 'Ethernet') + ' получен: ' + mac + ', рассылка ' + value['broadcast'] + ('; включение Wi-Fi не гарантируется' if kind == 'wifi' else ''))
     except Exception as error:
         operation_error(result, error, password)
         if result.get('stop') and access_gate:

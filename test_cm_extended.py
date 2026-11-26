@@ -1729,5 +1729,75 @@ class WakeOnLanTests(unittest.TestCase):
         self.assertEqual(seen,controls)
 
 
+
+class MacCollectionRegressionTests(unittest.TestCase):
+    def execute_script(self, rows, wifi=(), physical=('eth0',), mac='00:11:22:33:44:55', target='192.168.22.21', read_error=None):
+        import contextlib
+        from unittest.mock import mock_open
+        output=io.StringIO()
+        def exists(path):
+            return any(path=='/sys/class/net/'+name+'/device' for name in physical) or any(path=='/sys/class/net/'+name+'/wireless' for name in wifi)
+        opening=mock_open(read_data=mac+'\n')
+        if read_error:opening.side_effect=read_error
+        with patch('sys.argv',['-c',target]),patch('shutil.which',return_value='/usr/sbin/ip'),patch('subprocess.check_output',return_value=json.dumps(rows).encode()) as query,patch('os.path.exists',side_effect=exists),patch('builtins.open',opening),contextlib.redirect_stdout(output):
+            exec(compile(core.mac_collection_script(),'<string>','exec'),{})
+        return json.loads(output.getvalue()),opening,query
+
+    def row(self,name='eth0',ip='192.168.22.21'):
+        # Actual failure fixture: IPv4 data present, link-level "address" absent.
+        return dict(ifname=name,addr_info=[dict(family='inet',local=ip,prefixlen=24)])
+
+    def test_school_failure_missing_address_executes_real_script_and_reads_sysfs(self):
+        row=self.row()
+        self.assertNotIn('address',row)
+        result,opening,query=self.execute_script([row])
+        self.assertEqual((result['mac'],result['mac_type'],result['broadcast']),('00:11:22:33:44:55','ethernet','192.168.22.255'))
+        opening.assert_called_once_with('/sys/class/net/eth0/address',encoding='ascii')
+        self.assertEqual(query.call_args.args[0],['/usr/sbin/ip','-j','-4','address','show'])
+
+    def test_wifi_connection_gets_its_own_mac_without_selecting_another_ethernet(self):
+        rows=[self.row('eth0','192.168.22.50'),self.row('wlan0')]
+        result,opening,_=self.execute_script(rows,wifi=('wlan0',),physical=('eth0','wlan0'),mac='02:11:22:33:44:66')
+        self.assertEqual((result['interface'],result['mac_type'],result['mac']),('wlan0','wifi','02:11:22:33:44:66'))
+        opening.assert_called_once_with('/sys/class/net/wlan0/address',encoding='ascii')
+
+    def test_sysfs_is_authoritative_even_if_json_contains_an_address(self):
+        row=self.row();row['address']='00:aa:bb:cc:dd:ee'
+        result,_,_=self.execute_script([row])
+        self.assertEqual(result['mac'],'00:11:22:33:44:55')
+
+    def test_missing_sysfs_has_clear_error_without_keyerror_traceback(self):
+        with self.assertRaisesRegex(SystemExit,'Не удалось прочитать MAC адаптера'):
+            self.execute_script([self.row()],read_error=PermissionError('access denied'))
+
+    def test_ambiguous_and_virtual_adapters_are_not_guessed(self):
+        with self.assertRaisesRegex(SystemExit,'единственный адаптер'):
+            self.execute_script([self.row(),self.row('eth1')],physical=('eth0','eth1'))
+        with self.assertRaisesRegex(SystemExit,'виртуальному адаптеру'):
+            self.execute_script([self.row('br0')])
+
+    def test_failure_message_is_one_line_and_full_diagnostic_redacts_password(self):
+        failure='Traceback (most recent call last):\n  File "<string>", line 16\nKeyError: address private-secret\n'
+        with patch.object(core,'connect_verified',return_value=Mock()),patch.object(core,'run',return_value=(1,failure)):
+            result=core.collect_mac(core.Host('pc-01','','Lab'),dict(ip='192.168.22.21'),'private-secret')
+        self.assertFalse(result['ok'])
+        self.assertNotIn('\n',result['message'])
+        self.assertNotIn('private-secret',json.dumps(result))
+        self.assertIn('Traceback',result['diagnostic'])
+        self.assertNotIn('mac',result)
+        for failure in ('x'*4090+'private-secret', 'x'*215+'private-secret'):
+            with patch.object(core,'connect_verified',return_value=Mock()),patch.object(core,'run',return_value=(1,failure)):
+                bounded=core.collect_mac(core.Host('pc-01','','Lab'),dict(ip='192.168.22.21'),'private-secret')
+            self.assertNotIn('priva',json.dumps(bounded))
+
+    def test_wifi_metadata_roundtrips_and_old_mac_type_remains_unknown(self):
+        host=core.Host('pc-01','','Lab',mac='02:11:22:33:44:66',wol_broadcast='192.168.22.255',mac_type='wifi',mac_interface='wlan0')
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'inventory.json'
+            core.save_inventory(path,['Lab'],[host])
+            self.assertEqual(core.load_inventory(path)[1],[host])
+        self.assertEqual(core.validate_hosts([dict(name='pc-02',mac='00:11:22:33:44:55')])[0].mac_type,'')
+
+
 if __name__ == '__main__':
     unittest.main()

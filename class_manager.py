@@ -115,7 +115,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.5 — управление школьными компьютерами')
+        window.title('CM Astra 2.6 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -189,7 +189,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.5 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.6 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -623,7 +623,7 @@ class Manager:
             ('Логин SSH:', ttk.Entry(frame, textvariable=username, width=42)),
             ('Пароль:', ttk.Entry(frame, textvariable=password, show='*', width=42)),
             ('Учётная запись:', ttk.Combobox(frame, textvariable=credentials, values=('Общий user', 'Для этого ПК'), state='readonly', width=39)),
-            ('MAC Ethernet (WoL):', ttk.Entry(frame, textvariable=mac, width=42)),
+            ('MAC адаптера:', ttk.Entry(frame, textvariable=mac, width=42)),
             ('Адрес рассылки WoL:', ttk.Entry(frame, textvariable=broadcast, width=42))]):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
             widget.grid(row=row, column=1, sticky='ew', pady=6)
@@ -635,13 +635,15 @@ class Manager:
             ip_entry.configure(state='disabled' if mode.get().startswith('По имени') else 'normal')
         frame.grid_slaves(row=2, column=1)[0].bind('<<ComboboxSelected>>', mode_changed)
         mode_changed()
-        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя через настройки сети компьютера учителя.').grid(row=9, columnspan=2, sticky='w', pady=12)
+        ttk.Label(frame, text='Имя разрешается через настройки сети учителя.\nMAC-адаптер: ' + ((original.mac_interface or 'не указан') + ' · ' + {'wifi': 'Wi-Fi (включение не гарантируется)', 'ethernet': 'Ethernet', 'manual': 'введён вручную', '': 'тип не определён'}.get(original.mac_type, '') if original else 'не определён')).grid(row=9, columnspan=2, sticky='w', pady=12)
         ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=10, columnspan=2, sticky='w')
         ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=11, columnspan=2, sticky='w', pady=8)
         def save():
             try:
                 dns = mode.get().startswith('По имени')
-                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain, mac=mac.get(), wol_broadcast=broadcast.get())
+                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain, mac=mac.get(), wol_broadcast=broadcast.get(),
+                    mac_type=original.mac_type if original and mac.get() and mac_address(mac.get()) == original.mac else ('manual' if mac.get() else ''),
+                    mac_interface=original.mac_interface if original and mac.get() and mac_address(mac.get()) == original.mac else '')
                 rows = [asdict(h) for h in self.hosts if original is None or h.name != original.name]
                 rows.append(candidate)
                 hosts = validate_hosts(rows)
@@ -1261,7 +1263,7 @@ class Manager:
             self.finish_operation(identifier)
             messagebox.showerror('Включение не подготовлено', str(error), parent=self.window)
             return
-        details = '\n'.join(host.name + ' · ' + plans[host.name]['mac'] + ' → ' + plans[host.name]['broadcast'] + ' (с ' + plans[host.name]['source'] + ')' for host in hosts)
+        details = '\n'.join(host.name + (' [Wi-Fi: включение не гарантируется]' if host.mac_type == 'wifi' else '') + ' · ' + plans[host.name]['mac'] + ' → ' + plans[host.name]['broadcast'] + ' (с ' + plans[host.name]['source'] + ')' for host in hosts)
         if not messagebox.askokcancel('Включить выбранные ПК', details + '\n\nОтправить Wake-on-LAN и до 180 секунд проверять появление SSH с доверенным ключом?\nНужны проводная сеть, питание и заранее включённый WoL в BIOS/ОС. Пакет не гарантирует включение. Автоповтора нет.', default='cancel', parent=self.window):
             self.finish_operation(identifier)
             return
@@ -1305,7 +1307,7 @@ class Manager:
         if not values:
             return ''
         try:
-            hosts = [replace(host, mac=values[host.name]['mac'], wol_broadcast=values[host.name]['wol_broadcast']) if host.name in values else host for host in self.hosts]
+            hosts = [replace(host, mac=values[host.name]['mac'], wol_broadcast=values[host.name]['wol_broadcast'], mac_type=values[host.name].get('mac_type', ''), mac_interface=values[host.name].get('interface', '')) if host.name in values else host for host in self.hosts]
             save_inventory(self.inventory_file, self.rooms, hosts)
             self.hosts = hosts
             return ' MAC и адреса рассылки сохранены.'
@@ -1430,7 +1432,7 @@ class Manager:
                 self.trusted[row['name']] = {k: row[k] for k in ('type', 'key', 'fingerprint', 'name')}
             atomic_json(self.trust_file, self.trusted)
         names = ', '.join(row['name'] for row in permitted)
-        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на', 'time_sync': 'Синхронизировать время на', 'collect_mac': 'Получить MAC проводного подключения на'}[action]
+        verb = {'off': 'Выключить', 'reboot': 'Перезагрузить', 'cancel': 'Отменить запланированное выключение / перезагрузку на', 'distribute': 'Раздать файлы на', 'command': 'Выполнить команду на', 'time_sync': 'Синхронизировать время на', 'collect_mac': 'Получить MAC адаптера подключения на'}[action]
         text = verb + ' ' + str(len(permitted)) + (' компьютерах?' if action == 'cancel' else ' компьютеров?') + '\n\n' + names
         if action == 'time_sync':
             now = datetime.datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z (UTC%z)')
