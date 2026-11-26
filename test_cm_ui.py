@@ -21,6 +21,8 @@ class WorkbenchTests(unittest.TestCase):
         assets = root if (root / 'computers.json').exists() else root.parents[1] / 'outputs/CM-Astra'
         self.assets = patch.object(gui, 'ROOT', assets)
         self.assets.start()
+        fixtures = core.load_hosts(assets / 'legacy-lists' / 'comp2.lst')
+        core.save_inventory(Path(self.temp.name) / 'inventory.json', sorted({h.room for h in fixtures}), fixtures)
         self.app = gui.Manager(self.root, data=self.temp.name)
         self.root.update_idletasks()
 
@@ -249,6 +251,35 @@ class WorkbenchTests(unittest.TestCase):
         updated=next(h for h in app.hosts if h.name==old.name)
         self.assertEqual((updated.username,updated.credential_mode),('admin','host'))
         self.assertNotIn('private-test-value',app.inventory_file.read_text())
+
+
+    def test_optional_network_domain_persists_without_changing_trust_or_accounts(self):
+        app=self.app
+        app.trusted={'pc-01':dict(key='test-key')}
+        before=[(h.name,h.username,h.credential_mode) for h in app.hosts]
+        for value in ('school.example',''):
+            with patch.object(gui.simpledialog,'askstring',return_value=value):
+                app.network_settings()
+            self.assertTrue(all(h.domain==value for h in app.hosts))
+            self.assertEqual(json.loads(app.network_file.read_text())['domain'],value)
+            self.assertEqual([(h.name,h.username,h.credential_mode) for h in app.hosts],before)
+            self.assertEqual(app.trusted['pc-01']['key'],'test-key')
+        self.assertTrue(all(h.domain=='' for h in core.load_inventory(app.inventory_file)[1]))
+
+    def test_fresh_installation_can_start_without_school_computers(self):
+        assets=Path(self.temp.name)/'empty-assets'
+        assets.mkdir()
+        (assets/'computers.json').write_text('[]')
+        (assets/'key-catalog.json').write_text('{}')
+        window=tk.Toplevel(self.root)
+        with patch.object(gui,'ROOT',assets):
+            fresh=gui.Manager(window,data=Path(self.temp.name)/'fresh')
+        self.assertEqual(fresh.hosts,[])
+        self.assertEqual(fresh.rooms,[])
+        self.assertEqual(fresh.domain,'')
+        fresh.closing=True
+        fresh.shutdown.cancel()
+        window.destroy()
 
 
 if __name__ == '__main__':

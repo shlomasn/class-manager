@@ -27,11 +27,8 @@ class RangeTests(unittest.TestCase):
                 core.parse_addresses(value)
 
     def test_legacy_and_current_key_decoding(self):
-        root = Path(__file__).resolve().parent
-        catalog = root / 'key-catalog.json'
-        if not catalog.exists():
-            catalog = root.parents[1] / 'outputs/CM-Astra/key-catalog.json'
-        pin = next(iter(json.loads(catalog.read_text()).values()))
+        key = paramiko.RSAKey.generate(1024)
+        pin = dict(type=key.get_name(), key=key.get_base64(), fingerprint=core.fingerprint(key))
         current = core.decode_key(pin)
         with patch.object(paramiko, 'PKey', types.SimpleNamespace()):
             legacy = core.decode_key(pin)
@@ -1495,6 +1492,53 @@ class PerHostAccountTests(unittest.TestCase):
             self.assertIsNone(store.load('admin','pc-01'))
             self.assertEqual(store.load('admin','pc-02'),'two')
             self.assertEqual(store.load(),'common')
+
+
+
+class UniversalNetworkTests(unittest.TestCase):
+    def test_system_name_resolution_optional_suffix_and_fqdn(self):
+        from dataclasses import replace
+        answers=[(None,None,None,None,('10.20.30.40',22))]
+        host=core.Host('pc-01','','Lab')
+        with patch.object(core.socket,'getaddrinfo',return_value=answers) as lookup:
+            self.assertEqual(core.resolve(host),'10.20.30.40')
+            self.assertEqual(lookup.call_args.args[0],'pc-01')
+            core.resolve(replace(host,domain='school.example'))
+            self.assertEqual(lookup.call_args.args[0],'pc-01.school.example')
+            core.resolve(replace(host,name='pc-01.local',domain='school.example'))
+            self.assertEqual(lookup.call_args.args[0],'pc-01.local')
+        self.assertEqual(core.hostname('PC-01.SCHOOL.EXAMPLE'),'pc-01.school.example')
+
+    def test_private_ranges_and_public_loopback_rejection(self):
+        for ip in ('10.0.0.1','172.16.0.1','172.31.255.254','192.168.0.1'):
+            self.assertEqual(core.school_ip(ip),ip)
+        for ip in ('8.8.8.8','127.0.0.1','0.0.0.0','169.254.0.1','172.32.0.1','224.0.0.1'):
+            with self.assertRaises(ValueError): core.school_ip(ip)
+        self.assertEqual(core.parse_addresses('10.1.1.0/30'),['10.1.1.1','10.1.1.2'])
+        self.assertEqual(core.parse_addresses('172.16.1.1-172.16.1.2'),['172.16.1.1','172.16.1.2'])
+        with self.assertRaises(ValueError): core.parse_addresses('10.0.0.0/8')
+        with self.assertRaises(ValueError): core.parse_addresses('10.1.1.0/24',limit=2)
+
+    def test_legacy_inventory_migrates_but_explicit_empty_domain_stays_empty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'inventory.json'
+            path.write_text(json.dumps(dict(version=2,rooms=['208'],hosts=[dict(name='pc-01',room='208')])))
+            rooms,hosts=core.load_inventory(path)
+            self.assertEqual(hosts[0].domain,'534school.spb.ru')
+            from dataclasses import replace
+            core.save_inventory(path,rooms,[replace(hosts[0],domain='')])
+            self.assertEqual(core.load_inventory(path)[1][0].domain,'')
+            path.write_text('[]')
+            self.assertEqual(core.load_hosts(path),[])
+
+    def test_domain_validation_and_import_defaults(self):
+        self.assertEqual(core.dns_domain('School.EXAMPLE.'),'school.example')
+        for value in ('bad name','x;echo','-example','bad..example'):
+            with self.assertRaises(ValueError): core.dns_domain(value)
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'hosts.json'
+            path.write_text(json.dumps([dict(name='pc-01',ip='10.1.1.2',mode='fixed')]))
+            self.assertEqual(core.load_hosts(path)[0].domain,'')
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain
 import credential_store
 import cm_ui
 
@@ -94,7 +94,11 @@ class Manager:
             self.rooms, self.hosts = load_inventory(self.inventory_file)
         else:
             self.hosts = load_hosts(self.host_file if self.host_file.exists() else ROOT / 'computers.json')
+            if self.host_file.exists():
+                self.hosts = [replace(host, domain='534school.spb.ru') for host in self.hosts]  # Legacy runtime migration.
             self.rooms = sorted({host.room for host in self.hosts})
+        self.network_file = self.data / 'network.json'
+        self.domain = dns_domain(json.loads(self.network_file.read_text()).get('domain', '')) if self.network_file.exists() else (self.hosts[0].domain if self.hosts else '')
         self.catalog = json.loads((ROOT / 'key-catalog.json').read_text(encoding='utf-8'))
         self.trusted = json.loads(self.trust_file.read_text(encoding='utf-8')) if self.trust_file.exists() else {}
         self.trusted = {value.get('name', key): value for key, value in self.trusted.items()}
@@ -111,7 +115,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.2 — управление школьными компьютерами')
+        window.title('CM Astra 2.3 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -173,6 +177,7 @@ class Manager:
         self.menu_action(rooms, 'Добавить кабинет…', self.add_room, inventory=True)
         self.menu_action(rooms, 'Удалить текущий кабинет…', self.remove_room, inventory=True)
         menu.add_separator()
+        self.menu_action(menu, 'Настройки сети…', self.network_settings, inventory=True)
         self.menu_action(menu, 'Сохранить / изменить пароль…', self.save_password)
         self.menu_action(menu, 'Забыть сохранённый пароль', self.forget_password)
         menu.add_separator()
@@ -184,7 +189,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.2 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.3 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -500,7 +505,7 @@ class Manager:
         for host in incoming:
             old = current.get(host.name)
             current[host.name] = replace(old, room=host.room, username=host.username,
-                credential_mode='host') if old else host
+                credential_mode='host') if old else replace(host, domain=self.domain)
         hosts = list(current.values())
         rooms = sorted(set(self.rooms) | {host.room for host in incoming})
         # Validate the entire merge before asking for confirmation or saving.
@@ -518,6 +523,28 @@ class Manager:
         self.room.set('Все кабинеты')
         self.refresh()
         self.summary.set('CSV импортирован. Пароли задаются в карточках ПК или при подключении.')
+
+    def network_settings(self):
+        value = simpledialog.askstring('Настройки сети',
+            'Домен школы (необязательно). Пусто — использовать введённое имя.\n'
+            'DNS-сервер берётся из настроек ОС учителя.\n'
+            'Если имя не находится, задайте IP или используйте поиск по диапазону.\n'
+            'Изменение применяется к домену всех ПК, SSH-ключи сохраняются:',
+            initialvalue=self.domain, parent=self.window)
+        if value is None:
+            return
+        try:
+            domain = dns_domain(value)
+            hosts = [replace(host, domain=domain) for host in self.hosts]
+            save_inventory(self.inventory_file, self.rooms, hosts)
+            self.hosts = hosts
+            self.domain = domain
+            atomic_json(self.network_file, dict(version=1, domain=domain))
+            self.last_ips.clear()
+            self.statuses.clear()
+            self.refresh()
+        except Exception as error:
+            messagebox.showerror('Настройки сети', str(error), parent=self.window)
 
     def persist(self):
         save_inventory(self.inventory_file, self.rooms, self.hosts)
@@ -602,13 +629,13 @@ class Manager:
             ip_entry.configure(state='disabled' if mode.get().startswith('По имени') else 'normal')
         frame.grid_slaves(row=2, column=1)[0].bind('<<ComboboxSelected>>', mode_changed)
         mode_changed()
-        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя в домене 534school.spb.ru через школьный DNS.').grid(row=7, columnspan=2, sticky='w', pady=12)
+        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя через настройки сети компьютера учителя.').grid(row=7, columnspan=2, sticky='w', pady=12)
         ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=8, columnspan=2, sticky='w')
         ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=9, columnspan=2, sticky='w', pady=8)
         def save():
             try:
                 dns = mode.get().startswith('По имени')
-                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared')
+                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain)
                 rows = [asdict(h) for h in self.hosts if original is None or h.name != original.name]
                 rows.append(candidate)
                 hosts = validate_hosts(rows)
@@ -976,15 +1003,26 @@ class Manager:
                 self.set_busy(False)
                 self.summary.set('Поиск отменён до отправки пароля.')
                 return
-        password = self.get_password()
+        login = simpledialog.askstring('Учётная запись для поиска', 'Логин SSH на найденных ПК:', initialvalue='user', parent=self.window)
+        if not login:
+            self.set_busy(False)
+            return
+        try:
+            from cm_core import login_name
+            login = login_name(login)
+        except ValueError as error:
+            self.set_busy(False)
+            messagebox.showerror('Логин SSH', str(error), parent=self.window)
+            return
+        password = self.get_password() if login == 'user' else simpledialog.askstring('Пароль для поиска', 'Пароль SSH для ' + login + ':', show='*', parent=self.window)
         if not password:
             self.set_busy(False)
             return
         self.summary.set('Проверка имён и версии Astra через SSH; команды питания не отправляются…')
-        threading.Thread(target=self.inspect_worker, args=(rows, password), daemon=True).start()
+        threading.Thread(target=self.inspect_worker, args=(rows, password, login), daemon=True).start()
         password = None
 
-    def inspect_worker(self, rows, password):
+    def inspect_worker(self, rows, password, username='user'):
         results = []
         try:
             for row in rows:
@@ -992,7 +1030,8 @@ class Manager:
                 options = dict(control=control) if control else {}
                 if control:
                     control.check()
-                result = inspect_address(row, password, **options)
+                result = inspect_address(row, password, username=username, **options)
+                result['username'] = username
                 results.append(result)
                 self.events.put(('scan_progress', 'Проверено SSH-узлов: ' + str(len(results)) + ' из ' + str(len(rows))))
                 if result.get('stop'):
@@ -1059,7 +1098,7 @@ class Manager:
                 for row in candidates:
                     if row['name'] in selected:
                         old = next((h for h in self.hosts if h.name == row['name']), None)
-                        hosts.append(replace(old, ip=row['ip'], room=destination.get(), mode=row['mode']) if old else Host(row['name'], row['ip'], destination.get(), row['mode']))
+                        hosts.append(replace(old, ip=row['ip'], room=destination.get(), mode='fixed' if self.domain else row['mode']) if old else Host(row['name'], row['ip'], destination.get(), 'fixed' if self.domain else row['mode'], row.get('username', 'user'), 'host', self.domain))
                         new_trust[row['name']] = {key: row[key] for key in ('type', 'key', 'fingerprint', 'name')}
                 new_rooms = list(self.rooms)
                 if destination.get() not in new_rooms:

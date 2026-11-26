@@ -213,7 +213,7 @@ class InterfaceTests(unittest.TestCase):
 
 class NewFeaturesTests(unittest.TestCase):
     def test_dns_ignores_old_address_and_resolves_fqdn_every_time(self):
-        host = core.Host('a208-02', '192.168.22.2', '208')
+        host = core.Host('a208-02', '192.168.22.2', '208', domain='534school.spb.ru')
         with patch.object(core.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('192.168.22.88', 22))]) as resolver:
             self.assertEqual(core.resolve(host), '192.168.22.88')
             core.resolve(host)

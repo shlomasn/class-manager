@@ -77,6 +77,7 @@ class Host:
     mode: str = 'dns'
     username: str = 'user'
     credential_mode: str = 'shared'
+    domain: str = ''
 
 
 def login_name(value):
@@ -109,11 +110,18 @@ def load_csv(path):
     return validate_hosts(rows)
 
 
+def dns_domain(value):
+    value = value.strip().lower().strip('.')
+    if value and (len(value) > 253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in value.split('.'))):
+        raise ValueError('Недопустимый домен')
+    return value
+
+
 def hostname(value):
-    name = value.strip().lower().removesuffix('.534school.spb.ru')
+    name = value.strip().lower()
     if re.fullmatch(r'\d{3}-[a-z0-9-]+', name):
         name = 'a' + name
-    if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', name):
+    if not name or len(name) > 253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in name.split('.')):
         raise ValueError('Недопустимое имя компьютера: ' + value)
     return name
 
@@ -138,8 +146,11 @@ def load_hosts(path):
             if len(columns) not in (2, 3):
                 raise ValueError('Неверный формат строки ' + str(n))
             rows.append(dict(name=columns[0], ip=columns[1]))
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 250:
+    if not isinstance(rows, list) or len(rows) > 250 or (not rows and path.suffix.lower() != '.json'):
         raise ValueError('В списке должно быть от 1 до 250 компьютеров')
+    if path.suffix.lower() != '.json':
+        for row in rows:
+            row['name'] = row['name'].strip().lower().removesuffix('.534school.spb.ru')
     return validate_hosts(rows)
 
 
@@ -173,24 +184,25 @@ def validate_hosts(rows):
         credentials = row.get('credential_mode', 'shared' if login == 'user' else 'host')
         if credentials not in ('shared', 'host') or (credentials == 'shared' and login != 'user'):
             raise ValueError('Общий пароль доступен только для user')
-        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials))
+        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials, dns_domain(row.get('domain', ''))))
     return result
 
 
 def school_ip(value):
     ip = ipaddress.IPv4Address(value)
-    if ip not in ipaddress.ip_network('192.168.0.0/16'):
-        raise ValueError('Адрес вне школьной сети: ' + str(ip))
+    if not any(ip in ipaddress.ip_network(network) for network in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')):
+        raise ValueError('Требуется локальный IPv4 (10.*, 172.16–31.* или 192.168.*): ' + str(ip))
     return str(ip)
 
 
 def resolve(host):
     if host.mode == 'fixed':
         return school_ip(host.ip)
-    answers = socket.getaddrinfo(host.name + '.534school.spb.ru', 22, socket.AF_INET, socket.SOCK_STREAM)
+    query = host.name + '.' + host.domain if host.domain and '.' not in host.name else host.name
+    answers = socket.getaddrinfo(query, 22, socket.AF_INET, socket.SOCK_STREAM)
     addresses = sorted({school_ip(answer[4][0]) for answer in answers})
     if len(addresses) != 1:
-        raise ValueError('DNS должен возвращать один школьный IPv4; проверьте записи компьютера')
+        raise ValueError('Имя должно разрешаться в один локальный IPv4; проверьте сеть или задайте постоянный IP')
     return addresses[0]
 
 
@@ -201,7 +213,10 @@ def load_inventory(path):
     rooms = [room_name(value) for value in data['rooms']]
     if len(rooms) != len(set(rooms)) or len(rooms) > 100:
         raise ValueError('Повторные классы или более 100 классов')
-    hosts = validate_hosts(data['hosts'])
+    rows = data['hosts']
+    for row in rows:
+        row.setdefault('domain', '534school.spb.ru')  # Migration from 2.2 and earlier.
+    hosts = validate_hosts(rows)
     if any(host.room not in rooms for host in hosts):
         raise ValueError('Компьютер ссылается на отсутствующий класс')
     return rooms, hosts
@@ -357,7 +372,7 @@ def execute(host, pin, password, action, minutes, control=None):
         client.connect(ip, username=host.username, password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=6, auth_timeout=8)
         code, actual = run(client, '/bin/hostname -s', **options)
-        if code != 0 or actual.strip().lower() != host.name:
+        if code != 0 or actual.strip().lower() != host.name.split('.')[0]:
             raise RuntimeError('Имя ПК не совпало; команда питания не отправлена')
         code, version = run(client, '/usr/bin/cat /etc/astra/build_version', **options)
         if code != 0 or not version.strip().startswith('1.8.4.'):
@@ -405,7 +420,7 @@ def connect_verified(host, pin, password, control=None):
         client.connect(ip, username=host.username, password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=6, auth_timeout=8)
         code, actual = run(client, '/bin/hostname -s', **options)
-        if code != 0 or actual.strip().lower() != host.name:
+        if code != 0 or actual.strip().lower() != host.name.split('.')[0]:
             raise RuntimeError('Имя ПК не совпало; операция не выполнялась')
         code, version = run(client, '/usr/bin/cat /etc/astra/build_version', **options)
         if code != 0 or not version.strip().startswith('1.8.4.'):
@@ -860,7 +875,7 @@ def parse_addresses(text, limit=512):
     for token in tokens:
         if '/' in token:
             network = ipaddress.IPv4Network(token, strict=False)
-            if not network.subnet_of(ipaddress.ip_network('192.168.0.0/16')) or network.num_addresses > limit + 2:
+            if not any(network.subnet_of(ipaddress.ip_network(private)) for private in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')) or network.num_addresses > limit + 2:
                 raise ValueError('Диапазон вне школьной сети или более ' + str(limit) + ' адресов')
             values = network.hosts()
         elif '-' in token:
