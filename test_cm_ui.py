@@ -18,10 +18,15 @@ class WorkbenchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = tk.Tk()
         root = Path(__file__).resolve().parent
-        assets = root if (root / 'computers.json').exists() else root.parents[1] / 'outputs/CM-Astra'
+        assets = root
+        if not (root / 'computers.json').exists():
+            assets = Path(self.temp.name) / 'assets'
+            assets.mkdir()
+            (assets / 'computers.json').write_text('[]')
+            (assets / 'key-catalog.json').write_text('{}')
         self.assets = patch.object(gui, 'ROOT', assets)
         self.assets.start()
-        fixtures = core.load_hosts(assets / 'legacy-lists' / 'comp2.lst')
+        fixtures = [core.Host(f'pc-{i:02}', '', 'Учебный ' + str(1 + i // 13)) for i in range(1, 25)]
         core.save_inventory(Path(self.temp.name) / 'inventory.json', sorted({h.room for h in fixtures}), fixtures)
         self.app = gui.Manager(self.root, data=self.temp.name)
         self.root.update_idletasks()
@@ -189,7 +194,7 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_results_keep_json_and_readable_output_in_both_themes(self):
         app = self.app
-        app.last_results = [dict(name='a209-01', ok=True, message='Команда завершена, код 0', output='hello', cwd='~/lesson')]
+        app.last_results = [dict(name='a702-01', ok=True, message='Команда завершена, код 0', output='hello', cwd='~/lesson')]
         app.show_results()
         dialog = next(child for child in self.root.winfo_children() if isinstance(child, tk.Toplevel))
         def descendants(widget):
@@ -199,7 +204,7 @@ class WorkbenchTests(unittest.TestCase):
         notebook = next(child for child in descendants(dialog) if isinstance(child, ttk.Notebook))
         texts = [child for child in descendants(dialog) if isinstance(child, tk.Text)]
         self.assertEqual(len(notebook.tabs()), 2)
-        self.assertIn('a209-01 — Успешно', texts[0].get('1.0', 'end'))
+        self.assertIn('a702-01 — Успешно', texts[0].get('1.0', 'end'))
         self.assertIn('hello', texts[0].get('1.0', 'end'))
         self.assertEqual(json.loads(texts[1].get('1.0', 'end')), app.last_results)
         app.theme.set('dark')
@@ -214,7 +219,7 @@ class WorkbenchTests(unittest.TestCase):
         begin.assert_called_once_with('time_sync')
         host = app.hosts[0]
         operation = app.operations.start('time_sync', [host], {})
-        pin = dict(name=host.name, ip='192.168.22.1', ok=True, type='ssh-ed25519', key='key')
+        pin = dict(name=host.name, ip='10.42.22.1', ok=True, type='ssh-ed25519', key='key')
         with patch.object(gui, 'classify_key', return_value='trusted'), patch.object(gui.messagebox, 'askokcancel', return_value=False) as confirm, patch.object(app, 'get_password') as password, patch.object(gui.threading, 'Thread') as thread:
             app.discovered([host], 'time_sync', 0, [pin], operation_id=operation['id'])
         self.assertIn('компьютер учителя', confirm.call_args.args[1])
@@ -280,7 +285,7 @@ class WorkbenchTests(unittest.TestCase):
         app = self.app
         old = app.hosts[0]
         from dataclasses import replace
-        app.hosts[0] = replace(old, mode='fixed', ip='192.168.22.100')
+        app.hosts[0] = replace(old, mode='fixed', ip='10.42.22.100')
         path = Path(self.temp.name) / 'computers.csv'
         path.write_text('кабинет;компьютер;логин\nНовый;' + old.name + ';admin\n')
         before = list(app.hosts)
@@ -290,7 +295,7 @@ class WorkbenchTests(unittest.TestCase):
         with patch.object(gui.messagebox,'askokcancel',return_value=True):
             app.import_csv(path)
         changed = next(h for h in app.hosts if h.name == old.name)
-        self.assertEqual((changed.room,changed.username,changed.credential_mode,changed.ip),('Новый','admin','host','192.168.22.100'))
+        self.assertEqual((changed.room,changed.username,changed.credential_mode,changed.ip),('Новый','admin','host','10.42.22.100'))
         self.assertEqual(len(app.hosts),len(before))
 
     def test_editor_saves_scoped_password_and_preserves_other_host(self):
@@ -338,19 +343,35 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(all(h.domain=='' for h in core.load_inventory(app.inventory_file)[1]))
 
     def test_fresh_installation_can_start_without_school_computers(self):
-        assets=Path(self.temp.name)/'empty-assets'
-        assets.mkdir()
-        (assets/'computers.json').write_text('[]')
-        (assets/'key-catalog.json').write_text('{}')
-        window=tk.Toplevel(self.root)
-        with patch.object(gui,'ROOT',assets):
-            fresh=gui.Manager(window,data=Path(self.temp.name)/'fresh')
-        self.assertEqual(fresh.hosts,[])
-        self.assertEqual(fresh.rooms,[])
-        self.assertEqual(fresh.domain,'')
-        fresh.closing=True
-        fresh.shutdown.cancel()
-        window.destroy()
+        home = Path(self.temp.name) / 'clean-home'
+        appdata = home / 'AppData'
+        profile = {'HOME': str(home), 'USERPROFILE': str(home)}
+        for windows in (False, True):
+            with self.subTest(windows_profile=windows), patch.dict(gui.os.environ, profile):
+                if windows:
+                    gui.os.environ['APPDATA'] = str(appdata)
+                else:
+                    gui.os.environ.pop('APPDATA', None)
+                window = tk.Toplevel(self.root)
+                fresh = gui.Manager(window)
+                try:
+                    window.update()
+                    expected = (appdata if windows else home / '.local/share') / 'CM-Astra'
+                    self.assertEqual(fresh.data, expected)
+                    self.assertTrue(fresh.table.winfo_ismapped())
+                    self.assertEqual(fresh.table.get_children(), ())
+                    self.assertEqual(fresh.hosts, [])
+                    self.assertEqual(fresh.rooms, [])
+                    self.assertEqual(fresh.domain, '')
+                    self.assertEqual(fresh.trusted, {})
+                    self.assertEqual(fresh.catalog, {})
+                    self.assertEqual(fresh.theme.get(), 'light')
+                    self.assertEqual(list(expected.iterdir()), [])
+                finally:
+                    fresh.closing = True
+                    fresh.shutdown.cancel()
+                    window.destroy()
+
 
 
     def test_auto_network_dialog_cancel_does_not_scan(self):
@@ -393,7 +414,7 @@ class WorkbenchTests(unittest.TestCase):
             dialog=next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
             frame=dialog.winfo_children()[0]
             frame.grid_slaves(row=7,column=1)[0].insert(0,'00-11-22-33-44-55')
-            frame.grid_slaves(row=8,column=1)[0].insert(0,'192.168.22.255')
+            frame.grid_slaves(row=8,column=1)[0].insert(0,'10.42.22.255')
             bar=frame.grid_slaves(row=12,column=0)[0]
             next(w for w in bar.winfo_children() if w.cget('text')=='Сохранить').invoke()
         self.root.after(50,save_card)
@@ -401,12 +422,12 @@ class WorkbenchTests(unittest.TestCase):
             app.host_editor(old)
         error.assert_not_called();vault.assert_not_called()
         host=next(h for h in app.hosts if h.name==old.name)
-        self.assertEqual((host.mac,host.wol_broadcast),('00:11:22:33:44:55','192.168.22.255'))
+        self.assertEqual((host.mac,host.wol_broadcast),('00:11:22:33:44:55','10.42.22.255'))
         self.assertEqual(host.username,old.username)
 
     def test_collected_mac_only_updates_successful_computers(self):
         app=self.app;first,second=app.hosts[:2]
-        note=app.save_collected_macs([dict(name=first.name,action='collect_mac',ok=True,mac='00:11:22:33:44:55',wol_broadcast='192.168.22.255'),
+        note=app.save_collected_macs([dict(name=first.name,action='collect_mac',ok=True,mac='00:11:22:33:44:55',wol_broadcast='10.42.22.255'),
             dict(name=second.name,action='collect_mac',ok=False,mac='ff:ff:ff:ff:ff:ff')])
         self.assertIn('сохранены',note)
         self.assertIn(second,app.hosts)
@@ -415,12 +436,12 @@ class WorkbenchTests(unittest.TestCase):
     def test_wake_cancel_confirmation_sends_no_packets_and_releases_hosts(self):
         from dataclasses import replace
         app=self.app
-        host=replace(app.hosts[0],mac='00:11:22:33:44:55',wol_broadcast='192.168.22.255')
+        host=replace(app.hosts[0],mac='00:11:22:33:44:55',wol_broadcast='10.42.22.255')
         app.trusted[host.name]=dict(type='ssh-ed25519',key='key')
         operation=app.operations.start('wake',[host],{})
         app.preparing_operation=operation['id']
         with patch.object(gui.messagebox,'askokcancel',return_value=False),patch.object(gui.threading,'Thread') as thread:
-            app.wake_ready([host],[dict(ip='192.168.22.2',network='192.168.22.0/24')],operation['id'])
+            app.wake_ready([host],[dict(ip='10.42.22.2',network='10.42.22.0/24')],operation['id'])
         thread.assert_not_called()
         self.assertNotIn(host.name,app.operations.owners)
 
@@ -440,7 +461,7 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_wifi_mac_saved_and_shown_as_wifi_in_editor(self):
         app=self.app;old=app.hosts[0]
-        app.save_collected_macs([dict(name=old.name,action='collect_mac',ok=True,mac='02:11:22:33:44:66',wol_broadcast='192.168.22.255',mac_type='wifi',interface='wlan0')])
+        app.save_collected_macs([dict(name=old.name,action='collect_mac',ok=True,mac='02:11:22:33:44:66',wol_broadcast='10.42.22.255',mac_type='wifi',interface='wlan0')])
         host=next(h for h in app.hosts if h.name==old.name)
         self.assertEqual((host.mac_type,host.mac_interface),('wifi','wlan0'))
         seen=[]

@@ -20,20 +20,20 @@ class InventoryTests(unittest.TestCase):
         self.path = Path(self.temp.name) / 'list.lst'
 
     def test_legacy_lists_import(self):
-        base = Path(__file__).resolve().parent / 'legacy-lists'
-        self.assertEqual(len(core.load_hosts(base / 'comp.lst')), 12)
-        rows = core.load_hosts(base / 'comp2.lst')
-        self.assertEqual(len(rows), 24)
-        self.assertEqual(rows[0], core.Host('a208-01', '192.168.22.1', '208'))
+        self.path.write_text('# Заголовок\n701-01;10.42.1.2;\npc-02;10.42.1.3\n', encoding='cp1251')
+        self.assertEqual(core.load_hosts(self.path), [
+            core.Host('a701-01', '10.42.1.2', '701'),
+            core.Host('pc-02', '10.42.1.3', 'Без класса'),
+        ])
 
     def test_fqdn_and_utf8_bom(self):
-        self.path.write_bytes('\ufeffa210-p4.534school.spb.ru;192.168.201.39;\r\n'.encode())
-        self.assertEqual(core.load_hosts(self.path)[0].name, 'a210-p4')
+        self.path.write_bytes('\ufeffpc-01.school.example;10.42.1.2;\r\n'.encode())
+        self.assertEqual(core.load_hosts(self.path)[0].name, 'pc-01.school.example')
 
     def test_invalid_lists_rejected(self):
-        for content in ['a209-06;8.8.8.8;', 'a209-06;127.0.0.1;', 'a209-06;192.168.22.26;\na209-06;192.168.22.27;',
-                        'a209-06;192.168.22.26;extra;bad',
-                        'a209-06;192.168.22.26$(touch x);', 'a209-06;shutdown;192.168.22.26;', '']:
+        for content in ['a702-06;8.8.8.8;', 'a702-06;127.0.0.1;', 'a702-06;10.42.22.26;\na702-06;10.42.22.27;',
+                        'a702-06;10.42.22.26;extra;bad',
+                        'a702-06;10.42.22.26$(touch x);', 'a702-06;shutdown;10.42.22.26;', '']:
             with self.subTest(content=content):
                 self.path.write_text(content)
                 with self.assertRaises((ValueError, KeyError)):
@@ -56,12 +56,12 @@ class PowerTests(unittest.TestCase):
                 core.power_command(action, delay)
 
     def test_known_keys_follow_name_across_dhcp_and_unknown_still_asks(self):
-        row = dict(name='a209-06', ip='192.168.22.26', type='ssh-ed25519', key='key')
+        row = dict(name='a702-06', ip='10.42.22.26', type='ssh-ed25519', key='key')
         self.assertEqual(core.classify_key(row, {}, {row['name']: row}), 'trusted')
-        moved = dict(row, ip='192.168.22.99')
+        moved = dict(row, ip='10.42.22.99')
         self.assertEqual(core.classify_key(moved, {row['name']: row}, {}), 'trusted')
         self.assertEqual(core.classify_key(dict(moved, key='other'), {row['name']: row}, {}), 'changed')
-        self.assertEqual(core.classify_key(dict(row, name='a209-07'), {}, {row['name']: row}), 'new')
+        self.assertEqual(core.classify_key(dict(row, name='a702-07'), {}, {row['name']: row}), 'new')
 
     def test_password_only_in_stdin_without_pty(self):
         class Channel:
@@ -93,12 +93,12 @@ class PowerTests(unittest.TestCase):
                 test.connect_options = kw
                 if connection_error: raise connection_error
             def close(self): test.closed = True
-        replies = iter(replies or [(0, 'a209-06\n'), (0, '1.8.4.1\n'), (0, 'scheduled')])
+        replies = iter(replies or [(0, 'a702-06\n'), (0, '1.8.4.1\n'), (0, 'scheduled')])
         def run(client, command, **kw):
             test.commands.append((command, kw))
             return next(replies)
         with patch.object(paramiko, 'SSHClient', Client), patch.object(paramiko.PKey, 'from_type_string', return_value=object()), patch.object(core, 'run', run):
-            return core.execute(core.Host('a209-06', '192.168.22.26', '209'), {'type': 'ssh-ed25519', 'key': 'a2V5'}, 'hidden-test-password', action, 1)
+            return core.execute(core.Host('a702-06', '10.42.22.26', '702'), {'type': 'ssh-ed25519', 'key': 'a2V5'}, 'hidden-test-password', action, 1)
 
     def test_off_reboot_cancel_use_sudo_after_hostname_and_astra_checks(self):
         for action, ending in [('off', ' -P +1'), ('reboot', ' -r +1'), ('cancel', ' -c')]:
@@ -114,17 +114,17 @@ class PowerTests(unittest.TestCase):
             self.assertTrue(self.closed)
 
     def test_wrong_hostname_prevents_power_command(self):
-        result = self.perform([(0, 'a209-01')])
+        result = self.perform([(0, 'a702-01')])
         self.assertFalse(result['ok'])
         self.assertEqual(len(self.commands), 1)
 
     def test_wrong_os_prevents_sudo(self):
-        result = self.perform([(0, 'a209-06'), (1, 'file missing')])
+        result = self.perform([(0, 'a702-06'), (1, 'file missing')])
         self.assertFalse(result['ok'])
         self.assertEqual(len(self.commands), 2)
 
     def test_immediate_disconnect_is_not_reported_as_confirmed_success(self):
-        result = self.perform([(0, 'a209-06'), (0, '1.8.4.1'), (-1, '')])
+        result = self.perform([(0, 'a702-06'), (0, '1.8.4.1'), (-1, '')])
         self.assertFalse(result['ok'])
         self.assertIn('без подтверждения', result['message'])
         self.assertEqual(len(self.commands), 3)
@@ -140,12 +140,12 @@ class PowerTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_sudo_wrong_password_stops_and_redacts(self):
-        result = self.perform([(0, 'a209-06'), (0, '1.8.4.1'), (1, 'sudo: 1 incorrect password attempt hidden-test-password')])
+        result = self.perform([(0, 'a702-06'), (0, '1.8.4.1'), (1, 'sudo: 1 incorrect password attempt hidden-test-password')])
         self.assertTrue(result['stop'])
         self.assertNotIn('hidden-test-password', json.dumps(result))
 
     def test_remote_error_does_not_persist_secret(self):
-        result = self.perform([(0, 'a209-06'), (0, '1.8.4.1'), (1, 'failure hidden-test-password')])
+        result = self.perform([(0, 'a702-06'), (0, '1.8.4.1'), (1, 'failure hidden-test-password')])
         self.assertNotIn('hidden-test-password', json.dumps(result))
 
 
@@ -153,7 +153,7 @@ class InterfaceTests(unittest.TestCase):
     def app(self):
         app = gui.Manager.__new__(gui.Manager)
         app.window = object()
-        app.selected = {'a209-06'}
+        app.selected = {'a702-06'}
         app.statuses, app.trusted, app.catalog, app.last_ips = {}, {}, {}, {}
         app.credential_status = types.SimpleNamespace(set=lambda text: None)
         app.events = queue.Queue()
@@ -169,26 +169,26 @@ class InterfaceTests(unittest.TestCase):
 
     def test_cancel_confirmation_never_requests_password(self):
         app = self.app()
-        row = dict(name='a209-06', ip='192.168.22.26', ok=True, type='ssh-ed25519', key='key')
+        row = dict(name='a702-06', ip='10.42.22.26', ok=True, type='ssh-ed25519', key='key')
         app.trusted[row['name']] = row
         with patch.object(gui.messagebox, 'askokcancel', return_value=False), patch.object(gui.simpledialog, 'askstring') as password:
-            app.discovered([core.Host('a209-06', row['ip'], '209')], 'off', 1, [row])
+            app.discovered([core.Host('a702-06', row['ip'], '702')], 'off', 1, [row])
         password.assert_not_called()
 
     def test_refused_host_trust_never_requests_password(self):
         app = self.app()
         app.trust_dialog = lambda text: False
-        row = dict(name='a209-06', ip='192.168.22.26', ok=True, type='ssh-ed25519', key='key', fingerprint='SHA256:key')
+        row = dict(name='a702-06', ip='10.42.22.26', ok=True, type='ssh-ed25519', key='key', fingerprint='SHA256:key')
         with patch.object(gui.simpledialog, 'askstring') as password:
-            app.discovered([core.Host('a209-06', row['ip'], '209')], 'off', 1, [row])
+            app.discovered([core.Host('a702-06', row['ip'], '702')], 'off', 1, [row])
         password.assert_not_called()
         self.assertFalse(app.trusted)
 
     def test_scan_never_asks_password_or_trust(self):
         app = self.app()
-        row = dict(name='a209-06', ip='192.168.22.26', ok=True, type='ssh-ed25519', key='key')
+        row = dict(name='a702-06', ip='10.42.22.26', ok=True, type='ssh-ed25519', key='key')
         with patch.object(gui.simpledialog, 'askstring') as password:
-            app.discovered([core.Host('a209-06', row['ip'], '209')], 'scan', 1, [row])
+            app.discovered([core.Host('a702-06', row['ip'], '702')], 'scan', 1, [row])
         password.assert_not_called()
         self.assertFalse(app.trusted)
 
@@ -196,8 +196,8 @@ class InterfaceTests(unittest.TestCase):
         app = self.app()
         with tempfile.TemporaryDirectory() as directory:
             app.data = Path(directory)
-            rows = [dict(name='a209-%02d' % n, ip='192.168.22.%d' % (20 + n)) for n in range(1, 4)]
-            hosts = {r['name']: core.Host(r['name'], r['ip'], '209') for r in rows}
+            rows = [dict(name='a702-%02d' % n, ip='10.42.22.%d' % (20 + n)) for n in range(1, 4)]
+            hosts = {r['name']: core.Host(r['name'], r['ip'], '702') for r in rows}
             failure = dict(rows[0], ok=False, stop=True, message='Неверный пароль')
             with patch.object(gui, 'execute', return_value=failure) as execute:
                 app.send(hosts, rows, 'hidden-test-password', 'off', 1, [])
@@ -213,29 +213,29 @@ class InterfaceTests(unittest.TestCase):
 
 class NewFeaturesTests(unittest.TestCase):
     def test_dns_ignores_old_address_and_resolves_fqdn_every_time(self):
-        host = core.Host('a208-02', '192.168.22.2', '208', domain='534school.spb.ru')
-        with patch.object(core.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('192.168.22.88', 22))]) as resolver:
-            self.assertEqual(core.resolve(host), '192.168.22.88')
+        host = core.Host('a701-02', '10.42.22.2', '701', domain='school.example')
+        with patch.object(core.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('10.42.22.88', 22))]) as resolver:
+            self.assertEqual(core.resolve(host), '10.42.22.88')
             core.resolve(host)
             self.assertEqual(resolver.call_count, 2)
-            self.assertEqual(resolver.call_args.args[0], 'a208-02.534school.spb.ru')
+            self.assertEqual(resolver.call_args.args[0], 'a701-02.school.example')
 
     def test_dns_failure_never_falls_back_to_stale_ip(self):
         with patch.object(core.socket, 'getaddrinfo', side_effect=core.socket.gaierror()), patch.object(core.socket, 'create_connection') as connect:
-            result = core.probe(core.Host('a208-02', '192.168.22.2', '208'))
+            result = core.probe(core.Host('a701-02', '10.42.22.2', '701'))
         self.assertFalse(result['ok'])
         connect.assert_not_called()
 
     def test_ambiguous_or_public_dns_rejected(self):
-        for ips in [('192.168.22.2', '192.168.22.3'), ('8.8.8.8',)]:
+        for ips in [('10.42.22.2', '10.42.22.3'), ('8.8.8.8',)]:
             answers = [(None, None, None, None, (ip, 22)) for ip in ips]
             with patch.object(core.socket, 'getaddrinfo', return_value=answers):
                 with self.assertRaises(ValueError):
-                    core.resolve(core.Host('pc-01', '', '208'))
+                    core.resolve(core.Host('pc-01', '', '701'))
 
     def test_static_mode_does_not_resolve_dns(self):
         with patch.object(core.socket, 'getaddrinfo') as resolver:
-            self.assertEqual(core.resolve(core.Host('pc-01', '192.168.22.3', '208', 'fixed')), '192.168.22.3')
+            self.assertEqual(core.resolve(core.Host('pc-01', '10.42.22.3', '701', 'fixed')), '10.42.22.3')
         resolver.assert_not_called()
 
     def test_class_and_computer_edits_persist_including_empty_classes(self):
@@ -254,15 +254,15 @@ class NewFeaturesTests(unittest.TestCase):
     def test_bad_inventory_does_not_replace_saved_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'inventory.json'
-            core.save_inventory(path, ['208'], [])
+            core.save_inventory(path, ['701'], [])
             before = path.read_bytes()
-            for rooms, hosts in [(['208', '208'], []), ([], [core.Host('pc-01', '', '208')])]:
+            for rooms, hosts in [(['701', '701'], []), ([], [core.Host('pc-01', '', '701')])]:
                 with self.assertRaises(ValueError):
                     core.save_inventory(path, rooms, hosts)
                 self.assertEqual(path.read_bytes(), before)
 
     def test_duplicate_fixed_address_rejected_but_dns_hints_not_used(self):
-        rows = [dict(name='pc-01', ip='192.168.22.2', mode='fixed'), dict(name='pc-02', ip='192.168.22.2', mode='fixed')]
+        rows = [dict(name='pc-01', ip='10.42.22.2', mode='fixed'), dict(name='pc-02', ip='10.42.22.2', mode='fixed')]
         with self.assertRaises(ValueError):
             core.validate_hosts(rows)
         for row in rows:
@@ -278,13 +278,13 @@ class NewFeaturesTests(unittest.TestCase):
         app = InterfaceTests().app()
         with tempfile.TemporaryDirectory() as directory:
             app.inventory_file = Path(directory) / 'inventory.json'
-            app.rooms = ['208', '209']
-            app.hosts = [core.Host('a208-02', '', '208'), core.Host('a209-06', '', '209')]
-            app.room = types.SimpleNamespace(get=lambda: '208', set=lambda value: None)
+            app.rooms = ['701', '702']
+            app.hosts = [core.Host('a701-02', '', '701'), core.Host('a702-06', '', '702')]
+            app.room = types.SimpleNamespace(get=lambda: '701', set=lambda value: None)
             with patch.object(gui.messagebox, 'askyesno', return_value=True), patch.object(gui, 'execute') as execute:
                 app.remove_room()
-            self.assertEqual(app.rooms, ['209'])
-            self.assertEqual([host.name for host in app.hosts], ['a209-06'])
+            self.assertEqual(app.rooms, ['702'])
+            self.assertEqual([host.name for host in app.hosts], ['a702-06'])
             self.assertEqual(core.load_inventory(app.inventory_file), (app.rooms, app.hosts))
             execute.assert_not_called()
 

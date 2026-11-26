@@ -152,9 +152,6 @@ def load_hosts(path):
             rows.append(dict(name=columns[0], ip=columns[1]))
     if not isinstance(rows, list) or len(rows) > 250 or (not rows and path.suffix.lower() != '.json'):
         raise ValueError('В списке должно быть от 1 до 250 компьютеров')
-    if path.suffix.lower() != '.json':
-        for row in rows:
-            row['name'] = row['name'].strip().lower().removesuffix('.534school.spb.ru')
     return validate_hosts(rows)
 
 
@@ -216,7 +213,7 @@ def resolve(host):
     return addresses[0]
 
 
-def load_inventory(path):
+def load_inventory(path, default_domain=''):
     data = json.loads(Path(path).read_text(encoding='utf-8'))
     if data.get('version') != 2:
         raise ValueError('Неизвестная версия списка')
@@ -225,7 +222,7 @@ def load_inventory(path):
         raise ValueError('Повторные классы или более 100 классов')
     rows = data['hosts']
     for row in rows:
-        row.setdefault('domain', '534school.spb.ru')  # Migration from 2.2 and earlier.
+        row.setdefault('domain', default_domain)  # Legacy entries can use the profile's configured domain.
     hosts = validate_hosts(rows)
     if any(host.room not in rooms for host in hosts):
         raise ValueError('Компьютер ссылается на отсутствующий класс')

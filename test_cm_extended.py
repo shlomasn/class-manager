@@ -16,13 +16,13 @@ import class_manager as gui
 
 class RangeTests(unittest.TestCase):
     def test_formats_and_deduplication(self):
-        self.assertEqual(core.parse_addresses('192.168.22.2-192.168.22.4, 192.168.22.2;192.168.22.8/31'),
-                         ['192.168.22.2', '192.168.22.3', '192.168.22.4', '192.168.22.8', '192.168.22.9'])
-        self.assertEqual(core.parse_addresses('192.168.201.39/32'), ['192.168.201.39'])
+        self.assertEqual(core.parse_addresses('10.42.22.2-10.42.22.4, 10.42.22.2;10.42.22.8/31'),
+                         ['10.42.22.2', '10.42.22.3', '10.42.22.4', '10.42.22.8', '10.42.22.9'])
+        self.assertEqual(core.parse_addresses('10.42.201.39/32'), ['10.42.201.39'])
 
     def test_scope_and_size_limits_before_enumeration(self):
-        for value in ['', '8.8.8.8', '192.168.0.0/16', '192.168.22.4-192.168.22.2',
-                      '192.168.22.2-192.169.22.3', '192.168.0.1-192.168.3.1', '192.168.22.1;rm']:
+        for value in ['', '8.8.8.8', '192.168.0.0/16', '10.42.22.4-10.42.22.2',
+                      '10.42.22.2-192.169.22.3', '192.168.0.1-192.168.3.1', '10.42.22.1;rm']:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 core.parse_addresses(value)
 
@@ -37,8 +37,8 @@ class RangeTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
-    host = core.Host('a209-06', '', '209')
-    pin = dict(ip='192.168.22.26')
+    host = core.Host('a702-06', '', '702')
+    pin = dict(ip='10.42.22.26')
 
     def test_sudo_script_is_quoted_password_only_stdin_output_redacted(self):
         client = types.SimpleNamespace(close=lambda: None)
@@ -203,7 +203,7 @@ class UploadTests(unittest.TestCase):
 
     def upload(self, destination=None, progress=None, on_conflict=None):
         with patch.object(core, 'connect_verified', return_value=self.client):
-            return core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', [str(self.source)], 'batch-123', destination=destination, progress=progress, on_conflict=on_conflict)
+            return core.transfer_files(core.Host('a702-06', '', '702'), dict(ip='10.42.22.26'), 'secret', [str(self.source)], 'batch-123', destination=destination, progress=progress, on_conflict=on_conflict)
 
     def test_files_hash_checked_and_not_executed(self):
         result = self.upload()
@@ -291,7 +291,7 @@ class UploadTests(unittest.TestCase):
         prepared = {str(Path(path).resolve()): core.prepare_transfer(path) for path in paths}
         events = []
         with patch.object(core, 'connect_verified', return_value=self.client), patch.object(core, '_digest_stream', wraps=core._digest_stream) as hashes:
-            result = core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', paths, 'batch',
+            result = core.transfer_files(core.Host('a702-06', '', '702'), dict(ip='10.42.22.26'), 'secret', paths, 'batch',
                                          prepared=prepared, access_gate=core.TransferAccessGate(), progress=events.append)
         self.assertTrue(result['ok'], result)
         self.assertEqual(len(result['files']), 2)
@@ -302,7 +302,7 @@ class UploadTests(unittest.TestCase):
         self.source.write_bytes(b'replacement')
         prepared = {str(Path(path).resolve()): core.prepare_transfer(path) for path in paths}
         with patch.object(core, 'connect_verified', return_value=self.client):
-            result = core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', paths, 'batch-next',
+            result = core.transfer_files(core.Host('a702-06', '', '702'), dict(ip='10.42.22.26'), 'secret', paths, 'batch-next',
                                          prepared=prepared, access_gate=core.TransferAccessGate(), on_conflict=lambda path: path.endswith('.deb'))
         self.assertTrue(result['ok'], result)
         self.assertEqual(len(result['files']), 1)
@@ -311,7 +311,7 @@ class UploadTests(unittest.TestCase):
         self.assertEqual((self.inbox / second.name).read_bytes(), b'echo hello')
         second.write_bytes(b'changed after preparation')
         with patch.object(core, 'connect_verified', return_value=self.client):
-            result = core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', paths, 'partial',
+            result = core.transfer_files(core.Host('a702-06', '', '702'), dict(ip='10.42.22.26'), 'secret', paths, 'partial',
                                          destination='~/partial', prepared=prepared, access_gate=core.TransferAccessGate())
         self.assertFalse(result['ok'])
         self.assertEqual(len(result['files']), 1)
@@ -322,7 +322,7 @@ class UploadTests(unittest.TestCase):
         prepared = {str(self.source.resolve()): core.prepare_transfer(self.source)}
         self.source.write_bytes(b'changed after preparation')
         with patch.object(core, 'connect_verified', return_value=self.client):
-            result = core.transfer_files(core.Host('a209-06', '', '209'), dict(ip='192.168.22.26'), 'secret', [str(self.source)], 'batch',
+            result = core.transfer_files(core.Host('a702-06', '', '702'), dict(ip='10.42.22.26'), 'secret', [str(self.source)], 'batch',
                                          prepared=prepared, access_gate=core.TransferAccessGate())
         self.assertFalse(result['ok'])
         self.assertEqual(result['files'], [])
@@ -343,7 +343,7 @@ class UploadTests(unittest.TestCase):
         sftp.put = put
         self.client.open_sftp = lambda: sftp
         with patch.object(core, 'connect_verified', return_value=self.client):
-            result = core.transfer_files(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret',
+            result = core.transfer_files(core.Host('a702-01', '', '702'), dict(ip='10.42.22.1'), 'secret',
                                          [str(self.source), str(second)], 'batch', control=control)
         self.assertTrue(result['cancelled'])
         self.assertFalse(result['ok'])
@@ -354,7 +354,7 @@ class UploadTests(unittest.TestCase):
 
 
 class ScanIdentityTests(unittest.TestCase):
-    def inspect(self, replies, dns='192.168.22.26', auth_error=None):
+    def inspect(self, replies, dns='10.42.22.26', auth_error=None):
         self.calls = []
         self.closed = False
         outer = self
@@ -371,21 +371,21 @@ class ScanIdentityTests(unittest.TestCase):
             self.calls.append(command)
             return next(iterator)
         with patch.object(paramiko, 'SSHClient', Client), patch.object(core, 'decode_key', return_value=object()), patch.object(core, 'run', run), patch.object(core, 'resolve', return_value=dns):
-            return core.inspect_address(dict(ip='192.168.22.26', type='ssh-ed25519', key='key'), 'secret')
+            return core.inspect_address(dict(ip='10.42.22.26', type='ssh-ed25519', key='key'), 'secret')
 
     def test_scan_uses_actual_hostname_and_dns_mode_without_mutations(self):
-        result = self.inspect([(0, 'a209-06\n'), (0, '1.8.4.1')])
+        result = self.inspect([(0, 'a702-06\n'), (0, '1.8.4.1')])
         self.assertTrue(result['ok'])
-        self.assertEqual(result['name'], 'a209-06')
+        self.assertEqual(result['name'], 'a702-06')
         self.assertEqual(result['mode'], 'dns')
         self.assertEqual(self.calls, ['/bin/hostname -s', '/usr/bin/cat /etc/astra/build_version'])
         self.assertIsInstance(self.policy, paramiko.RejectPolicy)
         self.assertTrue(self.closed)
 
     def test_unconfirmed_dns_uses_fixed_address_and_wrong_os_rejected(self):
-        result = self.inspect([(0, 'a209-06'), (0, '1.8.4.1')], dns='192.168.22.27')
+        result = self.inspect([(0, 'a702-06'), (0, '1.8.4.1')], dns='10.42.22.27')
         self.assertEqual(result['mode'], 'fixed')
-        result = self.inspect([(0, 'a209-06'), (1, 'not found')])
+        result = self.inspect([(0, 'a702-06'), (1, 'not found')])
         self.assertFalse(result['ok'])
 
     def test_bad_scan_password_stops_without_hostname_commands(self):
@@ -427,10 +427,10 @@ class DispatchTests(unittest.TestCase):
                 app.data = Path(directory)
                 import queue
                 app.events = queue.Queue()
-                row = dict(name='a209-06', ip='192.168.22.26')
+                row = dict(name='a702-06', ip='10.42.22.26')
                 result = dict(row, ok=True, message='ok')
                 with patch.object(gui, function, return_value=result) as target, patch.object(gui, 'execute') as power:
-                    app.send({'a209-06': core.Host('a209-06', '', '209')}, [row], 'secret', action, 0, [], job)
+                    app.send({'a702-06': core.Host('a702-06', '', '702')}, [row], 'secret', action, 0, [], job)
                 target.assert_called_once()
                 power.assert_not_called()
 
@@ -441,14 +441,14 @@ class DispatchTests(unittest.TestCase):
             app.last_results = []
             report = app.data / 'reports/20261125-1.json'
             rows = [dict(name=name, action=action, files=[dict(path=path, sha256='a' * 64)])
-                    for name, action, path in [('a209-01', 'upload', '/home/user/Desktops/Desktop1/CM-Inbox/run.sh'),
-                                               ('a209-02', 'download', '/home/user/lesson/run.sh')]]
+                    for name, action, path in [('a702-01', 'upload', '/home/user/Desktops/Desktop1/CM-Inbox/run.sh'),
+                                               ('a702-02', 'download', '/home/user/lesson/run.sh')]]
             core.atomic_json(report, rows)
             groups = app.transferred_files()
             targets = groups[('run.sh', 'a' * 64)]
-            self.assertEqual(targets['a209-01']['cwd'], '/home/user/Desktops/Desktop1/CM-Inbox')
-            self.assertEqual(targets['a209-02']['cwd'], '/home/user/lesson')
-            self.assertEqual(targets['a209-01']['script'], targets['a209-02']['script'])
+            self.assertEqual(targets['a702-01']['cwd'], '/home/user/Desktops/Desktop1/CM-Inbox')
+            self.assertEqual(targets['a702-02']['cwd'], '/home/user/lesson')
+            self.assertEqual(targets['a702-01']['script'], targets['a702-02']['script'])
 
     def test_password_failure_stops_remaining_downloads(self):
         import queue
@@ -458,7 +458,7 @@ class DispatchTests(unittest.TestCase):
             path.write_bytes(b'data')
             app = gui.Manager.__new__(gui.Manager)
             app.data, app.events = Path(directory), queue.Queue()
-            rows = [dict(name='a209-' + str(n), ip='192.168.22.' + str(n)) for n in range(1, 9)]
+            rows = [dict(name='a702-' + str(n), ip='10.42.22.' + str(n)) for n in range(1, 9)]
             attempted = []
             denied = threading.Event()
             def connect(host, pin, password):
@@ -479,7 +479,7 @@ class DispatchTests(unittest.TestCase):
                     core.operation_error(result, error, password)
                 return result
             with patch.object(core, 'connect_verified', connect), patch.object(gui, 'transfer_files', download):
-                app.send({r['name']: core.Host(r['name'], '', '209') for r in rows}, rows, 'secret', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX))
+                app.send({r['name']: core.Host(r['name'], '', '702') for r in rows}, rows, 'secret', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX))
             self.assertEqual(len(attempted), 2)
             events = []
             while not app.events.empty():
@@ -499,7 +499,7 @@ class DispatchTests(unittest.TestCase):
             path.write_bytes(b'file contents')
             app = gui.Manager.__new__(gui.Manager)
             app.data, app.events = Path(directory), queue.Queue()
-            rows = [dict(name='a209-' + str(n), ip='192.168.22.' + str(n)) for n in range(1, 9)]
+            rows = [dict(name='a702-' + str(n), ip='10.42.22.' + str(n)) for n in range(1, 9)]
             second = Path(directory) / 'second.sh'
             second.write_bytes(b'echo hello')
             barrier = threading.Barrier(len(rows), timeout=3)
@@ -513,7 +513,7 @@ class DispatchTests(unittest.TestCase):
                 barrier.wait()  # Sequential or six-worker dispatch cannot pass this barrier.
                 return dict(name=host.name, ip=pin['ip'], action='download', ok=True, message='done')
             with patch.object(core, 'connect_verified', return_value=object()), patch.object(gui, 'transfer_files', download), patch.object(gui, 'prepare_transfer', wraps=core.prepare_transfer) as prepare:
-                app.send({r['name']: core.Host(r['name'], '', '209') for r in rows}, rows, 'secret', 'distribute', 0, [], dict(files=[str(path), str(second)], destination=core.DEFAULT_INBOX))
+                app.send({r['name']: core.Host(r['name'], '', '702') for r in rows}, rows, 'secret', 'distribute', 0, [], dict(files=[str(path), str(second)], destination=core.DEFAULT_INBOX))
             self.assertEqual(prepare.call_count, 2)
             self.assertEqual(len(prepared_ids), 8)
             self.assertEqual(len(set(prepared_ids)), 1)
@@ -536,22 +536,22 @@ class DispatchTests(unittest.TestCase):
         app.events = queue.Queue()
         app.sort_column, app.sort_reverse = None, False
         app.statuses = {}
-        app.distribution_state = {name: dict(percent=0, complete=False) for name in ['a209-01', 'a209-02']}
+        app.distribution_state = {name: dict(percent=0, complete=False) for name in ['a702-01', 'a702-02']}
         displayed = {}
         app.table = types.SimpleNamespace(exists=lambda name: True, set=lambda name, column, value: displayed.update({name: value}))
         app.progress = types.SimpleNamespace(stop=lambda: None, configure=lambda **kwargs: None)
         app.summary = types.SimpleNamespace(set=lambda value: None)
         app.window = types.SimpleNamespace(after=lambda *args: None)
         app.refresh = lambda: displayed.update({name: status[0] for name, status in app.statuses.items()})
-        for name, done in [('a209-01', 50), ('a209-02', 25)]:
+        for name, done in [('a702-01', 50), ('a702-02', 25)]:
             app.events.put(('distribution_progress', dict(name=name, done=done, total=100, phase='Скачивание')))
-        app.events.put(('result', dict(name='a209-01', action='download', ok=True, message='Файл скачан и проверен')))
-        app.events.put(('distribution_progress', dict(name='a209-01', done=80, total=100, phase='Скачивание')))
+        app.events.put(('result', dict(name='a702-01', action='download', ok=True, message='Файл скачан и проверен')))
+        app.events.put(('distribution_progress', dict(name='a702-01', done=80, total=100, phase='Скачивание')))
         app.poll()
-        self.assertEqual(displayed['a209-01'], 'Файл скачан и проверен')
-        self.assertIn('25%', displayed['a209-02'])
-        self.assertTrue(app.distribution_state['a209-01']['complete'])
-        self.assertFalse(app.distribution_state['a209-02']['complete'])
+        self.assertEqual(displayed['a702-01'], 'Файл скачан и проверен')
+        self.assertIn('25%', displayed['a702-02'])
+        self.assertTrue(app.distribution_state['a702-01']['complete'])
+        self.assertFalse(app.distribution_state['a702-02']['complete'])
 
     def test_command_status_shows_live_line_and_elapsed_time_until_result(self):
         import queue
@@ -563,16 +563,16 @@ class DispatchTests(unittest.TestCase):
         app.summary = types.SimpleNamespace(set=lambda value: None)
         app.window = types.SimpleNamespace(after=lambda *args: None)
         app.refresh = lambda: displayed.update({name: status[0] for name, status in app.statuses.items()})
-        app.events.put(('command_waiting', ['a209-01', 'a209-02']))
-        app.events.put(('command_progress', dict(name='a209-01', phase='Выполняется', elapsed=12, output='Preparing\n\x1b[32mInstalling package\x1b[0m\n')))
+        app.events.put(('command_waiting', ['a702-01', 'a702-02']))
+        app.events.put(('command_progress', dict(name='a702-01', phase='Выполняется', elapsed=12, output='Preparing\n\x1b[32mInstalling package\x1b[0m\n')))
         app.poll()
-        self.assertIn('12 с', displayed['a209-01'])
-        self.assertIn('Installing package', displayed['a209-01'])
-        self.assertNotIn('\x1b', displayed['a209-01'])
-        self.assertEqual(displayed['a209-02'], 'Ожидает выполнения команды')
-        app.events.put(('result', dict(name='a209-01', action='command', ok=True, message='Команда завершена, код 0')))
+        self.assertIn('12 с', displayed['a702-01'])
+        self.assertIn('Installing package', displayed['a702-01'])
+        self.assertNotIn('\x1b', displayed['a702-01'])
+        self.assertEqual(displayed['a702-02'], 'Ожидает выполнения команды')
+        app.events.put(('result', dict(name='a702-01', action='command', ok=True, message='Команда завершена, код 0')))
         app.poll()
-        self.assertEqual(displayed['a209-01'], 'Команда завершена, код 0')
+        self.assertEqual(displayed['a702-01'], 'Команда завершена, код 0')
 
 
 
@@ -590,7 +590,7 @@ class ConcurrentOperationsTests(unittest.TestCase):
         app.statuses, app.trusted, app.catalog, app.last_ips = {}, {}, {}, {}
         app.selected = set()
         app.last_upload_directory = None
-        app.hosts = [core.Host('a209-01', '', '209'), core.Host('a209-02', '', '209'), core.Host('a208-01', '', '208')]
+        app.hosts = [core.Host('a702-01', '', '702'), core.Host('a702-02', '', '702'), core.Host('a701-01', '', '701')]
         app.visible = lambda: app.hosts
         app.window = types.SimpleNamespace(after=Mock(), destroy=Mock())
         app.summary = types.SimpleNamespace(set=Mock())
@@ -630,10 +630,10 @@ class ConcurrentOperationsTests(unittest.TestCase):
             path.write_text('lesson')
             slow_started, release_slow = threading.Event(), threading.Event()
             def probe(host, **kwargs):
-                return dict(name=host.name, ip='192.168.22.1', ok=True, type='ssh-ed25519', key='key')
+                return dict(name=host.name, ip='10.42.22.1', ok=True, type='ssh-ed25519', key='key')
             def transfer(host, pin, password, paths, batch, progress, **kwargs):
                 progress(dict(phase='Передача', file='lesson.txt', done=1, total=10))
-                if host.name == 'a209-02':
+                if host.name == 'a702-02':
                     slow_started.set()
                     if not release_slow.wait(4):
                         raise RuntimeError('test timeout')
@@ -644,30 +644,30 @@ class ConcurrentOperationsTests(unittest.TestCase):
                 return dict(name=host.name, ip=pin['ip'], action='command', ok=True, message='Команда завершена')
             with patch.object(gui, 'probe', probe), patch.object(gui, 'classify_key', return_value='trusted'), patch.object(gui.messagebox, 'askokcancel', return_value=True), patch.object(gui, 'transfer_files', transfer), patch.object(gui, 'execute_command', command):
                 try:
-                    app.selected = {'a209-01', 'a209-02'}
+                    app.selected = {'a702-01', 'a702-02'}
                     app.begin('distribute', dict(files=[str(path)], destination=core.DEFAULT_INBOX))
                     first = next(iter(app.operations.active))
-                    self.process_until(app, lambda: 'a209-01' not in app.operations.owners)
+                    self.process_until(app, lambda: 'a702-01' not in app.operations.owners)
                     self.assertTrue(slow_started.wait(2))
-                    self.assertIn('a209-01', app.transferred_files()[('setup.sh', 'a' * 64)])
+                    self.assertIn('a702-01', app.transferred_files()[('setup.sh', 'a' * 64)])
                     self.assertFalse(app.busy)
                     self.assertEqual(app.action_button.options['state'], 'normal')
                     self.assertEqual(app.edit_button.options['state'], 'disabled')
                     app.select_visible()
-                    self.assertNotIn('a209-02', app.selected)
-                    app.selected = {'a209-02'}
+                    self.assertNotIn('a702-02', app.selected)
+                    app.selected = {'a702-02'}
                     with patch.object(gui.threading, 'Thread') as thread, patch.object(gui.messagebox, 'showinfo'):
                         app.begin('command', dict(script='hostname', sudo=False, timeout=30, cwd='~'))
                     thread.assert_not_called()
-                    app.selected = {'a209-01'}
+                    app.selected = {'a702-01'}
                     app.begin('command', dict(script='hostname', sudo=False, timeout=30, cwd='~'))
                     second = next(identifier for identifier in app.operations.active if identifier != first)
                     self.process_until(app, lambda: second not in app.operations.active)
                     self.assertIn(first, app.operations.active)
-                    self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
+                    self.assertEqual(app.statuses['a702-01'][0], 'Команда завершена')
                     # A late packet from the older batch cannot overwrite this new result.
-                    app.handle_event('distribution_progress', dict(name='a209-01', phase='OLD', done=9, total=10), first)
-                    self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
+                    app.handle_event('distribution_progress', dict(name='a702-01', phase='OLD', done=9, total=10), first)
+                    self.assertEqual(app.statuses['a702-01'][0], 'Команда завершена')
                 finally:
                     release_slow.set()
                 self.process_until(app, lambda: not app.operations.active)
@@ -685,11 +685,11 @@ class ConcurrentOperationsTests(unittest.TestCase):
             old['state'] = 'running'
             new = app.operations.start('command', app.hosts[1:2], dict(script='new-script'))
             app.preparing_operation, app.busy = new['id'], True
-            app.handle_event('finished', ([dict(name='a209-01', ok=True)], 'report.json'), old['id'])
+            app.handle_event('finished', ([dict(name='a702-01', ok=True)], 'report.json'), old['id'])
             self.assertTrue(app.busy)
             self.assertEqual(app.preparing_operation, new['id'])
             self.assertEqual(new['job']['script'], 'new-script')
-            self.assertEqual(app.operations.owners, {'a209-02': new['id']})
+            self.assertEqual(app.operations.owners, {'a702-02': new['id']})
             self.assertEqual(app.action_button.options['state'], 'disabled')
             with patch.object(gui.messagebox, 'showerror'):
                 app.handle_event('error', 'old event', old['id'])
@@ -701,14 +701,14 @@ class ConcurrentOperationsTests(unittest.TestCase):
             app = self.app(directory)
             operation = app.operations.start('distribute', app.hosts[:2], dict(files=['lesson']))
             operation['state'] = 'running'
-            operation['results'].append(dict(name='a209-01', ok=True, message='Передано'))
-            app.operations.release(operation['id'], 'a209-01')
+            operation['results'].append(dict(name='a702-01', ok=True, message='Передано'))
+            app.operations.release(operation['id'], 'a702-01')
             client = types.SimpleNamespace(close=Mock())
             app.shutdown.add(client)
             with patch.object(gui.messagebox, 'askyesno', return_value=False) as ask:
                 app.close()
             self.assertEqual(ask.call_args.kwargs['default'], 'no')
-            self.assertIn('a209-02', ask.call_args.args[1])
+            self.assertIn('a702-02', ask.call_args.args[1])
             self.assertFalse(app.shutdown.cancelled.is_set())
             self.assertFalse(app.closing)
             client.close.assert_not_called()
@@ -753,9 +753,9 @@ class ConcurrentOperationsTests(unittest.TestCase):
             def transfer(host, pin, password, paths, batch, on_conflict, **kwargs):
                 on_conflict('/home/user/lesson.txt')
                 raise AssertionError('Cancellation should interrupt the wait')
-            pin = dict(name='a209-01', ip='192.168.22.1')
+            pin = dict(name='a702-01', ip='10.42.22.1')
             with patch.object(gui, 'transfer_files', transfer):
-                thread = threading.Thread(target=app.send, args=({'a209-01': app.hosts[0]}, [pin], 'test-password', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), app.events, app.shutdown))
+                thread = threading.Thread(target=app.send, args=({'a702-01': app.hosts[0]}, [pin], 'test-password', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), app.events, app.shutdown))
                 thread.start()
                 while True:
                     kind, value = app.events.get(timeout=2)
@@ -808,25 +808,25 @@ class ConcurrentOperationsTests(unittest.TestCase):
             batch['state'] = other['state'] = 'running'
             batch['controls'] = {host.name: core.OperationControl(parent=app.shutdown, reason='Раздача отменена пользователем') for host in app.hosts[:2]}
             clients = [types.SimpleNamespace(close=Mock()) for _ in app.hosts]
-            batch['controls']['a209-01'].add(clients[0])
-            batch['controls']['a209-02'].add(clients[1])
+            batch['controls']['a702-01'].add(clients[0])
+            batch['controls']['a702-02'].add(clients[1])
             app.shutdown.add(clients[2])
             app.table.focus = lambda name: None
-            app.toggle('a209-01')
-            app.selected.add('a208-01')  # The cancel button must ignore a command target.
+            app.toggle('a702-01')
+            app.selected.add('a701-01')  # The cancel button must ignore a command target.
             app.cancel_distribution()
             clients[0].close.assert_called_once()
             clients[1].close.assert_not_called()
             clients[2].close.assert_not_called()
             self.assertFalse(app.shutdown.cancelled.is_set())
-            self.assertEqual(app.operations.owners['a209-01'], batch['id'])
-            self.assertIn('Отмена', app.statuses['a209-01'][0])
-            app.handle_event('distribution_progress', dict(name='a209-01', phase='late', done=9, total=10), batch['id'])
-            self.assertIn('Отмена', app.statuses['a209-01'][0])
-            app.handle_event('result', dict(name='a209-01', action='upload', ok=False, cancelled=True, message='Раздача отменена пользователем'), batch['id'])
-            self.assertNotIn('a209-01', app.operations.owners)
-            self.assertEqual(app.operations.owners['a209-02'], batch['id'])
-            self.assertEqual(app.operations.owners['a208-01'], other['id'])
+            self.assertEqual(app.operations.owners['a702-01'], batch['id'])
+            self.assertIn('Отмена', app.statuses['a702-01'][0])
+            app.handle_event('distribution_progress', dict(name='a702-01', phase='late', done=9, total=10), batch['id'])
+            self.assertIn('Отмена', app.statuses['a702-01'][0])
+            app.handle_event('result', dict(name='a702-01', action='upload', ok=False, cancelled=True, message='Раздача отменена пользователем'), batch['id'])
+            self.assertNotIn('a702-01', app.operations.owners)
+            self.assertEqual(app.operations.owners['a702-02'], batch['id'])
+            self.assertEqual(app.operations.owners['a701-01'], other['id'])
             app.shutdown.cancel()
             clients[1].close.assert_called_once()
             clients[2].close.assert_called_once()
@@ -842,14 +842,14 @@ class ConcurrentOperationsTests(unittest.TestCase):
             operation['controls'] = {host.name: core.OperationControl(parent=app.shutdown, reason='Раздача отменена пользователем') for host in app.hosts[:2]}
             sibling_started, release_sibling = threading.Event(), threading.Event()
             def transfer(host, pin, password, paths, batch, on_conflict, control, **kwargs):
-                if host.name == 'a209-01':
+                if host.name == 'a702-01':
                     on_conflict('/home/user/lesson.txt')
                     raise AssertionError('The cancelled overwrite wait should not resume')
                 sibling_started.set()
                 self.assertTrue(release_sibling.wait(4))
                 control.check()
                 return dict(name=host.name, ip=pin['ip'], action='upload', ok=True, files=[], message='Передано')
-            pins = [dict(name=h.name, ip='192.168.22.1') for h in app.hosts[:2]]
+            pins = [dict(name=h.name, ip='10.42.22.1') for h in app.hosts[:2]]
             with patch.object(gui, 'transfer_files', transfer):
                 thread = threading.Thread(target=app.send, args=({h.name: h for h in app.hosts[:2]}, pins, 'secret', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), gui.OperationEvents(app.events, operation['id']), app.shutdown, operation['controls']))
                 thread.start()
@@ -861,10 +861,10 @@ class ConcurrentOperationsTests(unittest.TestCase):
                             break  # Leave the question unanswered, then cancel this host.
                         app.handle_event(kind, value, identifier)
                     self.assertTrue(sibling_started.wait(2))
-                    app.selected = {'a209-01'}
+                    app.selected = {'a702-01'}
                     app.cancel_distribution()
-                    self.process_until(app, lambda: 'a209-01' not in app.operations.owners)
-                    self.assertIn('a209-02', app.operations.owners)
+                    self.process_until(app, lambda: 'a702-01' not in app.operations.owners)
+                    self.assertIn('a702-02', app.operations.owners)
                     self.assertFalse(app.shutdown.cancelled.is_set())
                 finally:
                     release_sibling.set()
@@ -879,8 +879,8 @@ class ConcurrentOperationsTests(unittest.TestCase):
         import threading
         with tempfile.TemporaryDirectory() as directory:
             app = self.app(directory)
-            hosts = [core.Host('a209-' + str(n), '', '209') for n in range(1, 9)]
-            rows = [dict(name=h.name, ip='192.168.22.1') for h in hosts]
+            hosts = [core.Host('a702-' + str(n), '', '702') for n in range(1, 9)]
+            rows = [dict(name=h.name, ip='10.42.22.1') for h in hosts]
             barrier = threading.Barrier(len(hosts), timeout=3)
             def connect(host, pin, password, **kwargs):
                 return types.SimpleNamespace(name=host.name, close=lambda: None)
@@ -902,8 +902,8 @@ class ConcurrentOperationsTests(unittest.TestCase):
     def test_parallel_commands_stop_new_password_attempts_after_first_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self.app(directory)
-            hosts = [core.Host('a209-' + str(n), '', '209') for n in range(1, 9)]
-            rows = [dict(name=h.name, ip='192.168.22.1') for h in hosts]
+            hosts = [core.Host('a702-' + str(n), '', '702') for n in range(1, 9)]
+            rows = [dict(name=h.name, ip='10.42.22.1') for h in hosts]
             with patch.object(core, 'connect_verified', side_effect=paramiko.AuthenticationException('wrong')) as connect, patch.object(core, 'run') as run:
                 app.send({h.name: h for h in hosts}, rows, 'secret', 'command', 0, [], dict(script='id', sudo=False, timeout=30))
             connect.assert_called_once()
@@ -916,7 +916,7 @@ class ConcurrentOperationsTests(unittest.TestCase):
     def test_sudo_password_failure_blocks_next_command_without_reconnecting(self):
         gate = core.TransferAccessGate()
         client = types.SimpleNamespace(close=lambda: None)
-        host, pin = core.Host('a209-01', '', '209'), dict(ip='192.168.22.1')
+        host, pin = core.Host('a702-01', '', '702'), dict(ip='10.42.22.1')
         with patch.object(core, 'connect_verified', return_value=client) as connect, patch.object(core, 'run', return_value=(1, 'incorrect password')) as run:
             first = core.execute_command(host, pin, 'secret', 'id', sudo=True, access_gate=gate)
             second = core.execute_command(host, pin, 'secret', 'id', sudo=True, access_gate=gate)
@@ -933,7 +933,7 @@ class ConcurrentOperationsTests(unittest.TestCase):
             path.write_text('lesson')
             controls = {host.name: core.OperationControl(parent=app.shutdown, reason='Раздача отменена пользователем') for host in app.hosts[:2]}
             for control in controls.values(): control.cancel()
-            rows = [dict(name=h.name, ip='192.168.22.1') for h in app.hosts[:2]]
+            rows = [dict(name=h.name, ip='10.42.22.1') for h in app.hosts[:2]]
             with patch.object(gui, 'transfer_files') as transfer:
                 app.send({h.name: h for h in app.hosts[:2]}, rows, 'secret', 'distribute', 0, [], dict(files=[str(path)], destination=core.DEFAULT_INBOX), control=app.shutdown, host_controls=controls)
             transfer.assert_not_called()
@@ -949,15 +949,15 @@ class ConcurrentOperationsTests(unittest.TestCase):
         sibling = core.OperationControl(parent=parent)
         gate = core.TransferAccessGate(parent)
         def connect(host, pin, password, control):
-            if host.name == 'a209-01':
+            if host.name == 'a702-01':
                 control.cancel()
                 raise paramiko.AuthenticationException('transport closed')
             return 'connected sibling'
         with patch.object(core, 'connect_verified', connect):
             with self.assertRaises(core.OperationCancelled):
-                gate.connect(core.Host('a209-01', '', '209'), {}, 'secret', control=cancelled)
+                gate.connect(core.Host('a702-01', '', '702'), {}, 'secret', control=cancelled)
             self.assertFalse(gate.stopped.is_set())
-            self.assertEqual(gate.connect(core.Host('a209-02', '', '209'), {}, 'secret', control=sibling), 'connected sibling')
+            self.assertEqual(gate.connect(core.Host('a702-02', '', '702'), {}, 'secret', control=sibling), 'connected sibling')
         self.assertFalse(parent.cancelled.is_set())
 
 
@@ -969,36 +969,36 @@ class ConcurrentOperationsTests(unittest.TestCase):
             operation['controls'] = {h.name: core.CommandControl(parent=app.shutdown) for h in app.hosts[:2]}
             other = app.operations.start('distribute', app.hosts[2:], {})
             app.table.focus = lambda name: None
-            app.toggle('a209-01')
+            app.toggle('a702-01')
             with patch.object(gui.messagebox, 'askokcancel', return_value=False):
                 app.stop_commands()
-            self.assertFalse(operation['controls']['a209-01'].stop_requested.is_set())
+            self.assertFalse(operation['controls']['a702-01'].stop_requested.is_set())
             with patch.object(gui.messagebox, 'askokcancel', return_value=True):
                 app.stop_commands()
-            self.assertTrue(operation['controls']['a209-01'].stop_requested.is_set())
-            self.assertFalse(operation['controls']['a209-02'].stop_requested.is_set())
+            self.assertTrue(operation['controls']['a702-01'].stop_requested.is_set())
+            self.assertFalse(operation['controls']['a702-02'].stop_requested.is_set())
             self.assertFalse(app.shutdown.cancelled.is_set())
-            self.assertEqual(app.operations.owners['a209-01'], operation['id'])
-            app.handle_event('command_progress', dict(name='a209-01', phase='Выполняется', elapsed=1, output='late'), operation['id'])
-            self.assertIn('Остановка', app.statuses['a209-01'][0])
-            app.handle_event('result', dict(name='a209-01', action='command', ok=False, cancelled=True, stop_confirmed=True, message='Команда остановлена'), operation['id'])
-            self.assertNotIn('a209-01', app.operations.owners)
-            self.assertEqual(app.operations.owners['a209-02'], operation['id'])
-            self.assertEqual(app.operations.owners['a208-01'], other['id'])
+            self.assertEqual(app.operations.owners['a702-01'], operation['id'])
+            app.handle_event('command_progress', dict(name='a702-01', phase='Выполняется', elapsed=1, output='late'), operation['id'])
+            self.assertIn('Остановка', app.statuses['a702-01'][0])
+            app.handle_event('result', dict(name='a702-01', action='command', ok=False, cancelled=True, stop_confirmed=True, message='Команда остановлена'), operation['id'])
+            self.assertNotIn('a702-01', app.operations.owners)
+            self.assertEqual(app.operations.owners['a702-02'], operation['id'])
+            self.assertEqual(app.operations.owners['a701-01'], other['id'])
 
     def test_finishing_during_stop_confirmation_keeps_final_status(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self.app(directory)
             operation = app.operations.start('command', app.hosts[:1], {})
             control = core.CommandControl(parent=app.shutdown)
-            operation['controls'] = {'a209-01': control}
-            app.selected = {'a209-01'}
+            operation['controls'] = {'a702-01': control}
+            app.selected = {'a702-01'}
             def confirm(*args, **kwargs):
-                app.handle_event('result', dict(name='a209-01', action='command', ok=True, message='Команда завершена'), operation['id'])
+                app.handle_event('result', dict(name='a702-01', action='command', ok=True, message='Команда завершена'), operation['id'])
                 return True
             with patch.object(gui.messagebox, 'askokcancel', side_effect=confirm):
                 app.stop_commands()
-            self.assertEqual(app.statuses['a209-01'][0], 'Команда завершена')
+            self.assertEqual(app.statuses['a702-01'][0], 'Команда завершена')
             self.assertFalse(control.stop_requested.is_set())
 
     def test_invalid_theme_preferences_fall_back_safely(self):
@@ -1016,8 +1016,8 @@ class ConcurrentOperationsTests(unittest.TestCase):
         import threading
         with tempfile.TemporaryDirectory() as directory:
             app = self.app(directory)
-            hosts = [core.Host('a209-' + str(n), '', '209') for n in range(1, 9)]
-            rows = [dict(name=h.name, ip='192.168.22.1') for h in hosts]
+            hosts = [core.Host('a702-' + str(n), '', '702') for n in range(1, 9)]
+            rows = [dict(name=h.name, ip='10.42.22.1') for h in hosts]
             barrier = threading.Barrier(8, timeout=3)
             def synchronize(host, pin, password, access_gate, progress, **kwargs):
                 access_gate.connect(host, pin, password)
@@ -1090,7 +1090,7 @@ class ManagedCommandTests(unittest.TestCase):
             client, channel = self.local_client()
             control = core.CommandControl()
             with patch.object(core, 'connect_verified', return_value=client):
-                result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'pwd; printf done; exit 7', cwd=directory, control=control)
+                result = core.execute_command(core.Host('a702-01', '', '702'), dict(ip='10.42.22.1'), 'secret', 'pwd; printf done; exit 7', cwd=directory, control=control)
             self.assertFalse(result['ok'])
             self.assertEqual(result['exit'], 7)
             self.assertIn(directory, result['output'])
@@ -1111,7 +1111,7 @@ class ManagedCommandTests(unittest.TestCase):
             script = 'echo $$ > ' + shlex.quote(str(pidfile)) + "; trap '' TERM; sleep 60 & wait"
             def execute():
                 with patch.object(core, 'connect_verified', return_value=client):
-                    results.append(core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', script, control=control, progress=events.append))
+                    results.append(core.execute_command(core.Host('a702-01', '', '702'), dict(ip='10.42.22.1'), 'secret', script, control=control, progress=events.append))
             thread = threading.Thread(target=execute)
             thread.start()
             try:
@@ -1133,7 +1133,7 @@ class ManagedCommandTests(unittest.TestCase):
                 # A separate supervisor/client is unaffected by this stop request.
                 sibling_client, sibling_channel = self.local_client()
                 with patch.object(core, 'connect_verified', return_value=sibling_client):
-                    sibling = core.execute_command(core.Host('a209-02', '', '209'), dict(ip='192.168.22.2'), 'secret', 'printf sibling', control=core.CommandControl())
+                    sibling = core.execute_command(core.Host('a702-02', '', '702'), dict(ip='10.42.22.2'), 'secret', 'printf sibling', control=core.CommandControl())
                 self.assertTrue(sibling['ok'], sibling)
                 self.assertEqual(sibling['output'], 'sibling')
             finally:
@@ -1156,7 +1156,7 @@ class ManagedCommandTests(unittest.TestCase):
             scripts = ["printf target; trap '' TERM; sleep 60 & wait", 'touch ' + shlex.quote(str(ready)) + '; while [ ! -f ' + shlex.quote(str(release)) + ' ]; do sleep .05; done; printf sibling']
             def connect(host, pin, password, **kwargs): return clients[int(host.name[-1]) - 1]
             def execute(index):
-                results[index] = core.execute_command(core.Host('a209-0' + str(index + 1), '', '209'), dict(ip='192.168.22.1'), 'secret', scripts[index], control=controls[index])
+                results[index] = core.execute_command(core.Host('a702-0' + str(index + 1), '', '702'), dict(ip='10.42.22.1'), 'secret', scripts[index], control=controls[index])
             threads = [threading.Thread(target=execute, args=(n,)) for n in range(2)]
             with patch.object(core, 'connect_verified', connect):
                 for thread in threads: thread.start()
@@ -1203,7 +1203,7 @@ class ManagedCommandTests(unittest.TestCase):
         errors = []
         def connect():
             try:
-                gate.connect(core.Host('a209-01', '', '209'), {}, 'secret', control=control)
+                gate.connect(core.Host('a702-01', '', '702'), {}, 'secret', control=control)
             except core.OperationCancelled:
                 errors.append('cancelled')
         gate.lock.acquire()
@@ -1225,7 +1225,7 @@ class ManagedCommandTests(unittest.TestCase):
         control.request_stop()
         gate = core.TransferAccessGate()
         with patch.object(core, 'connect_verified') as connect:
-            result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'id', control=control, access_gate=gate)
+            result = core.execute_command(core.Host('a702-01', '', '702'), dict(ip='10.42.22.1'), 'secret', 'id', control=control, access_gate=gate)
         self.assertTrue(result['cancelled'])
         self.assertFalse(result.get('stop', False))
         self.assertFalse(gate.stopped.is_set())
@@ -1235,7 +1235,7 @@ class ManagedCommandTests(unittest.TestCase):
         client = types.SimpleNamespace(close=lambda: None)
         control = core.CommandControl()
         with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run_managed', side_effect=RuntimeError('Связь потеряна; остановка не подтверждена')):
-            result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'sleep 10', control=control)
+            result = core.execute_command(core.Host('a702-01', '', '702'), dict(ip='10.42.22.1'), 'secret', 'sleep 10', control=control)
         self.assertFalse(result['ok'])
         self.assertFalse(result.get('stop_confirmed', False))
         self.assertIn('не подтверждена', result['message'])
@@ -1244,7 +1244,7 @@ class ManagedCommandTests(unittest.TestCase):
         client = types.SimpleNamespace(close=lambda: None)
         control = core.CommandControl()
         with patch.object(core, 'connect_verified', return_value=client), patch.object(core, 'run_managed', return_value=(0, 'done', dict(exit=0, cancelled=False, stop_confirmed=False))) as run:
-            result = core.execute_command(core.Host('a209-01', '', '209'), dict(ip='192.168.22.1'), 'secret', 'id', sudo=True, cwd='~/lesson files', control=control)
+            result = core.execute_command(core.Host('a702-01', '', '702'), dict(ip='10.42.22.1'), 'secret', 'id', sudo=True, cwd='~/lesson files', control=control)
         self.assertTrue(result['ok'])
         self.assertEqual(run.call_args.kwargs['password'], 'secret')
         self.assertNotIn('secret', run.call_args.args[1])
@@ -1256,8 +1256,8 @@ class ManagedCommandTests(unittest.TestCase):
 
 
 class TimeSynchronizationTests(unittest.TestCase):
-    host = core.Host('a209-01', '', '209')
-    pin = dict(ip='192.168.22.1')
+    host = core.Host('a702-01', '', '702')
+    pin = dict(ip='10.42.22.1')
 
     def exchange(self, mode='success'):
         clock = [0.0]
@@ -1375,11 +1375,11 @@ class PerHostAccountTests(unittest.TestCase):
         from dataclasses import asdict
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'inventory.json'
-            hosts = core.validate_hosts([dict(name='pc-01', room='208'),
-                dict(name='pc-02', room='208', username='admin', credential_mode='host')])
+            hosts = core.validate_hosts([dict(name='pc-01', room='701'),
+                dict(name='pc-02', room='701', username='admin', credential_mode='host')])
             self.assertEqual((hosts[0].username, hosts[0].credential_mode), ('user', 'shared'))
-            core.save_inventory(path, ['208'], hosts)
-            self.assertEqual(core.load_inventory(path), (['208'], hosts))
+            core.save_inventory(path, ['701'], hosts)
+            self.assertEqual(core.load_inventory(path), (['701'], hosts))
             self.assertNotIn('password', path.read_text())
             for login in ('bad name', '-root', 'a\nroot', 'a;echo'):
                 with self.assertRaises(ValueError):
@@ -1391,13 +1391,13 @@ class PerHostAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'input.csv'
             for encoding in ('utf-8-sig', 'cp1251'):
-                path.write_bytes('кабинет;компьютер;логин\n208;pc-01;admin\n209;pc-02;\n'.encode(encoding))
+                path.write_bytes('кабинет;компьютер;логин\n701;pc-01;admin\n702;pc-02;\n'.encode(encoding))
                 hosts = core.load_csv(path)
                 self.assertEqual([(h.room,h.name,h.username,h.credential_mode) for h in hosts],
-                    [('208','pc-01','admin','host'),('209','pc-02','user','host')])
-            for text in ('кабинет;компьютер;логин;пароль\n208;pc-01;admin;secret',
-                'кабинет;компьютер;логин\n208;pc-01;admin;secret',
-                'кабинет;компьютер;логин\n208;pc-01;admin\n209;PC-01;user',
+                    [('701','pc-01','admin','host'),('702','pc-02','user','host')])
+            for text in ('кабинет;компьютер;логин;пароль\n701;pc-01;admin;secret',
+                'кабинет;компьютер;логин\n701;pc-01;admin;secret',
+                'кабинет;компьютер;логин\n701;pc-01;admin\n702;PC-01;user',
                 'кабинет;компьютер;логин\n'):
                 path.write_text(text)
                 with self.assertRaises(ValueError):
@@ -1422,9 +1422,9 @@ class PerHostAccountTests(unittest.TestCase):
         import queue
         import class_manager as gui
         app = gui.Manager.__new__(gui.Manager)
-        hosts = {h.name:h for h in (core.Host('pc-01','','208','dns','admin','host'),
-                                    core.Host('pc-02','','208'))}
-        pins = [dict(name=name,ip='192.168.22.1') for name in hosts]
+        hosts = {h.name:h for h in (core.Host('pc-01','','701','dns','admin','host'),
+                                    core.Host('pc-02','','701'))}
+        pins = [dict(name=name,ip='10.42.22.1') for name in hosts]
         secrets = {'pc-01':'first-secret','pc-02':'shared-secret'}
         calls = {}
         def execute(host,pin,password,*args,**kwargs):
@@ -1443,7 +1443,7 @@ class PerHostAccountTests(unittest.TestCase):
         app = gui.Manager.__new__(gui.Manager)
         app.window = None
         app.get_password = Mock(return_value='shared')
-        hosts = [core.Host('pc-01','','208','dns','admin','host'),core.Host('pc-02','','208')]
+        hosts = [core.Host('pc-01','','701','dns','admin','host'),core.Host('pc-02','','701')]
         with patch.object(gui.credential_store,'load',return_value='individual') as load:
             values = app.get_host_passwords(hosts)
         self.assertEqual(values,{'pc-01':'individual','pc-02':'shared'})
@@ -1457,7 +1457,7 @@ class PerHostAccountTests(unittest.TestCase):
         key = Mock()
         client.get_host_keys.return_value = Mock()
         with patch('paramiko.SSHClient',return_value=client), patch.object(core,'decode_key',return_value=key), patch.object(core,'run',side_effect=[(0,'pc-01'),(0,'1.8.4.1')]):
-            core.connect_verified(core.Host('pc-01','','208','dns','admin','host'),dict(ip='192.168.22.1',type='ssh-ed25519'),'own-secret')
+            core.connect_verified(core.Host('pc-01','','701','dns','admin','host'),dict(ip='10.42.22.1',type='ssh-ed25519'),'own-secret')
         self.assertEqual(client.connect.call_args.kwargs['username'],'admin')
         self.assertEqual(client.connect.call_args.kwargs['password'],'own-secret')
 
@@ -1525,12 +1525,13 @@ class UniversalNetworkTests(unittest.TestCase):
     def test_legacy_inventory_migrates_but_explicit_empty_domain_stays_empty(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'inventory.json'
-            path.write_text(json.dumps(dict(version=2,rooms=['208'],hosts=[dict(name='pc-01',room='208')])))
-            rooms,hosts=core.load_inventory(path)
-            self.assertEqual(hosts[0].domain,'534school.spb.ru')
+            path.write_text(json.dumps(dict(version=2,rooms=['701'],hosts=[dict(name='pc-01',room='701')])))
+            self.assertEqual(core.load_inventory(path)[1][0].domain, '')
+            rooms,hosts=core.load_inventory(path, default_domain='school.example')
+            self.assertEqual(hosts[0].domain, 'school.example')
             from dataclasses import replace
             core.save_inventory(path,rooms,[replace(hosts[0],domain='')])
-            self.assertEqual(core.load_inventory(path)[1][0].domain,'')
+            self.assertEqual(core.load_inventory(path, default_domain='school.example')[1][0].domain, '')
             path.write_text('[]')
             self.assertEqual(core.load_hosts(path),[])
 
@@ -1734,7 +1735,7 @@ class WakeOnLanTests(unittest.TestCase):
 
 
 class MacCollectionRegressionTests(unittest.TestCase):
-    def execute_script(self, rows, wifi=(), physical=('eth0',), mac='00:11:22:33:44:55', target='192.168.22.21', read_error=None):
+    def execute_script(self, rows, wifi=(), physical=('eth0',), mac='00:11:22:33:44:55', target='10.42.22.21', read_error=None):
         import contextlib
         from unittest.mock import mock_open
         output=io.StringIO()
@@ -1746,7 +1747,7 @@ class MacCollectionRegressionTests(unittest.TestCase):
             exec(compile(core.mac_collection_script(),'<string>','exec'),{})
         return json.loads(output.getvalue()),opening,query
 
-    def row(self,name='eth0',ip='192.168.22.21'):
+    def row(self,name='eth0',ip='10.42.22.21'):
         # Actual failure fixture: IPv4 data present, link-level "address" absent.
         return dict(ifname=name,addr_info=[dict(family='inet',local=ip,prefixlen=24)])
 
@@ -1754,12 +1755,12 @@ class MacCollectionRegressionTests(unittest.TestCase):
         row=self.row()
         self.assertNotIn('address',row)
         result,opening,query=self.execute_script([row])
-        self.assertEqual((result['mac'],result['mac_type'],result['broadcast']),('00:11:22:33:44:55','ethernet','192.168.22.255'))
+        self.assertEqual((result['mac'],result['mac_type'],result['broadcast']),('00:11:22:33:44:55','ethernet','10.42.22.255'))
         opening.assert_called_once_with('/sys/class/net/eth0/address',encoding='ascii')
         self.assertEqual(query.call_args.args[0],['/usr/sbin/ip','-j','-4','address','show'])
 
     def test_wifi_connection_gets_its_own_mac_without_selecting_another_ethernet(self):
-        rows=[self.row('eth0','192.168.22.50'),self.row('wlan0')]
+        rows=[self.row('eth0','10.42.22.50'),self.row('wlan0')]
         result,opening,_=self.execute_script(rows,wifi=('wlan0',),physical=('eth0','wlan0'),mac='02:11:22:33:44:66')
         self.assertEqual((result['interface'],result['mac_type'],result['mac']),('wlan0','wifi','02:11:22:33:44:66'))
         opening.assert_called_once_with('/sys/class/net/wlan0/address',encoding='ascii')
@@ -1782,7 +1783,7 @@ class MacCollectionRegressionTests(unittest.TestCase):
     def test_failure_message_is_one_line_and_full_diagnostic_redacts_password(self):
         failure='Traceback (most recent call last):\n  File "<string>", line 16\nKeyError: address private-secret\n'
         with patch.object(core,'connect_verified',return_value=Mock()),patch.object(core,'run',return_value=(1,failure)):
-            result=core.collect_mac(core.Host('pc-01','','Lab'),dict(ip='192.168.22.21'),'private-secret')
+            result=core.collect_mac(core.Host('pc-01','','Lab'),dict(ip='10.42.22.21'),'private-secret')
         self.assertFalse(result['ok'])
         self.assertNotIn('\n',result['message'])
         self.assertNotIn('private-secret',json.dumps(result))
@@ -1790,11 +1791,11 @@ class MacCollectionRegressionTests(unittest.TestCase):
         self.assertNotIn('mac',result)
         for failure in ('x'*4090+'private-secret', 'x'*215+'private-secret'):
             with patch.object(core,'connect_verified',return_value=Mock()),patch.object(core,'run',return_value=(1,failure)):
-                bounded=core.collect_mac(core.Host('pc-01','','Lab'),dict(ip='192.168.22.21'),'private-secret')
+                bounded=core.collect_mac(core.Host('pc-01','','Lab'),dict(ip='10.42.22.21'),'private-secret')
             self.assertNotIn('priva',json.dumps(bounded))
 
     def test_wifi_metadata_roundtrips_and_old_mac_type_remains_unknown(self):
-        host=core.Host('pc-01','','Lab',mac='02:11:22:33:44:66',wol_broadcast='192.168.22.255',mac_type='wifi',mac_interface='wlan0')
+        host=core.Host('pc-01','','Lab',mac='02:11:22:33:44:66',wol_broadcast='10.42.22.255',mac_type='wifi',mac_interface='wlan0')
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'inventory.json'
             core.save_inventory(path,['Lab'],[host])

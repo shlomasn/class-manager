@@ -90,15 +90,16 @@ class Manager:
         self.host_file = self.data / 'computers.json'
         self.trust_file = self.data / 'trusted-keys.json'
         self.inventory_file = self.data / 'inventory.json'
+        self.network_file = self.data / 'network.json'
+        saved_domain = dns_domain(json.loads(self.network_file.read_text()).get('domain', '')) if self.network_file.exists() else None
         if self.inventory_file.exists():
-            self.rooms, self.hosts = load_inventory(self.inventory_file)
+            self.rooms, self.hosts = load_inventory(self.inventory_file, default_domain=saved_domain or '')
         else:
             self.hosts = load_hosts(self.host_file if self.host_file.exists() else ROOT / 'computers.json')
-            if self.host_file.exists():
-                self.hosts = [replace(host, domain='534school.spb.ru') for host in self.hosts]  # Legacy runtime migration.
+            if saved_domain is not None and self.host_file.exists():
+                self.hosts = [replace(host, domain=saved_domain) if not host.domain else host for host in self.hosts]
             self.rooms = sorted({host.room for host in self.hosts})
-        self.network_file = self.data / 'network.json'
-        self.domain = dns_domain(json.loads(self.network_file.read_text()).get('domain', '')) if self.network_file.exists() else (self.hosts[0].domain if self.hosts else '')
+        self.domain = saved_domain if saved_domain is not None else (self.hosts[0].domain if self.hosts else '')
         self.catalog = json.loads((ROOT / 'key-catalog.json').read_text(encoding='utf-8'))
         self.trusted = json.loads(self.trust_file.read_text(encoding='utf-8')) if self.trust_file.exists() else {}
         self.trusted = {value.get('name', key): value for key, value in self.trusted.items()}

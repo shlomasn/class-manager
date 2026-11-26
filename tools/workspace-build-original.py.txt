@@ -1,49 +1,13 @@
 from pathlib import Path
 import ast
-import base64
 import hashlib
-import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
-from cm_core import load_hosts, validate_hosts
-
 HERE = Path(__file__).resolve().parent
-OUTPUTS = HERE.parents[1] / 'outputs'
-OUT = OUTPUTS / 'CM-Astra'
-OUT.mkdir(exist_ok=True)
-for name in ['class_manager.py', 'cm_ui.py', 'cm_core.py', 'credential_store.py', 'test_cm.py', 'test_cm_extended.py', 'test_cm_ui.py']:
-    shutil.copy2(HERE / name, OUT / name)
-    ast.parse((OUT / name).read_text(), feature_version=(3, 9))
-(OUT / 'legacy-lists').mkdir(exist_ok=True)
-for name in ['comp.lst', 'comp2.lst']:
-    shutil.copy2(HERE / 'legacy-lists' / name, OUT / 'legacy-lists' / name)
-hosts = load_hosts(HERE / 'legacy-lists/comp2.lst')
-rows = []  # New installations start with their own school, never another school's PCs.
-validate_hosts(rows)
-name_by_ip = {row['ip']: row['name'] for row in rows}
-(OUT / 'computers.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2))
-# Host key expectations from earlier read-only collection, not silent trust.
-catalog = {}
-for folder in ['astra-classroom-remote', 'astra-classroom-remote-a208-a210']:
-    for name in ['known_hosts', 'local_known_hosts']:
-        path = OUTPUTS / folder / name
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line or line.startswith('#'):
-                continue
-            ip, kind, key = line.split()[:3]
-            item = dict(type=kind, key=key, fingerprint='SHA256:' + base64.b64encode(hashlib.sha256(base64.b64decode(key)).digest()).decode().rstrip('='))
-            if ip not in name_by_ip:
-                continue
-            name = name_by_ip[ip]
-            if name in catalog:
-                assert catalog[name] == item
-            catalog[name] = item
-(OUT / 'key-catalog.json').write_text(json.dumps(catalog, indent=2))
 launcher = r'''@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
@@ -81,33 +45,45 @@ echo CM Astra could not start. Send the visible error text to your administrator
 pause
 exit /b 1
 '''
-(OUT / 'Start-CM.cmd').write_bytes(launcher.replace('\n', '\r\n').encode('ascii'))
-for name in ['Start-CM.sh', 'Install-CM-Astra.sh']:
-    shutil.copy2(HERE / name, OUT / name)
-    subprocess.run(['sh', '-n', str(OUT / name)], check=True)
-    (OUT / name).chmod(0o755)
-(OUT / 'requirements.txt').write_text('paramiko==5.1.0\n')
-shutil.copy2(HERE / 'README-RU.txt', OUT / 'README-RU.txt')
-shutil.copy2(HERE / 'computers-example.csv', OUT / 'computers-example.csv')
-results = []
-tests = ['test_cm.py', 'test_cm_extended.py']
-if '--ui-tests' in sys.argv:
-    tests.append('test_cm_ui.py')
-for test in tests:
-    result = subprocess.run([sys.executable, '-B', str(OUT / test)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
-    results.append(result.stdout + result.stderr)
-(OUT / 'TEST-RESULTS.txt').write_text('CM Astra 2.7; 26.11.2026\n' + '\n'.join(results) + ('\nReal Tk UI tests ran on ' + sys.platform + ' with an actual desktop session. This is not Windows/Astra pilot validation.\n' if '--ui-tests' in sys.argv else '\nReal Tk UI tests were not run in this build; run test_cm_ui.py in a desktop session.\n') + '\nTests use fake SSH/SFTP and platform vault APIs. Teacher-clock synchronization protocol is tested with a stub clock_settime; no system clocks were changed. Real Astra SSH/sudo time synchronization is pending. Selected remote command stop is exercised with real local Python/Bash process groups (SSH/sudo mocked). Selective per-host cancellation, parallel command dispatch, independent concurrent operations, per-host release, exit confirmation/cancellation, parallel multi-file distribution and live command output/heartbeat/redaction are covered; local Bash validates directory quoting. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.\n')
-files = sorted(p for p in OUT.rglob('*') if p.is_file() and '__pycache__' not in p.parts and not any(x.startswith('.venv') for x in p.parts) and p.name != 'SHA256SUMS.txt')
-(OUT / 'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.relative_to(OUT).as_posix() + '\n' for p in files))
-for name in ['CM-Astra-2.7.zip', 'CM-Astra-Windows.zip', 'CM-Astra-AstraLinux.zip']:
-    archive = OUTPUTS / name
-    with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
-        for p in files + [OUT / 'SHA256SUMS.txt']:
-            z.write(p, 'CM-Astra/' + p.relative_to(OUT).as_posix())
-    with zipfile.ZipFile(archive) as z:
-        assert z.testzip() is None
-        for p in files:
-            assert z.read('CM-Astra/' + p.relative_to(OUT).as_posix()) == p.read_bytes()
-    print('Built and tested', archive)
-print('Computers:', len(rows), 'known key expectations:', len(catalog))
+
+OUTPUTS = HERE.parents[1] / 'outputs' / 'school-distribution'
+OUTPUTS.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='cm-build-', dir=OUTPUTS) as temporary:
+    OUT = Path(temporary) / 'CM-Astra'
+    OUT.mkdir()
+    for name in ['class_manager.py', 'cm_ui.py', 'cm_core.py', 'credential_store.py', 'test_cm.py', 'test_cm_extended.py', 'test_cm_ui.py']:
+        shutil.copy2(HERE / name, OUT / name)
+        ast.parse((OUT / name).read_text(), feature_version=(3, 9))
+    (OUT / 'computers.json').write_text('[]')
+    (OUT / 'key-catalog.json').write_text('{}')
+    (OUT / 'docs').mkdir()
+    shutil.copy2(HERE / 'docs/first-start.md', OUT / 'docs/first-start.md')
+    (OUT / 'Start-CM.cmd').write_bytes(launcher.replace('\n', '\r\n').encode('ascii'))
+    for name in ['Start-CM.sh', 'Install-CM-Astra.sh']:
+        shutil.copy2(HERE / name, OUT / name)
+        subprocess.run(['sh', '-n', str(OUT / name)], check=True)
+        (OUT / name).chmod(0o755)
+    (OUT / 'requirements.txt').write_text('paramiko==5.1.0\n')
+    shutil.copy2(HERE / 'README-RU.txt', OUT / 'README-RU.txt')
+    shutil.copy2(HERE / 'computers-example.csv', OUT / 'computers-example.csv')
+    results = []
+    tests = ['test_cm.py', 'test_cm_extended.py']
+    if '--ui-tests' in sys.argv:
+        tests.append('test_cm_ui.py')
+    for test in tests:
+        result = subprocess.run([sys.executable, '-B', str(OUT / test)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        results.append(result.stdout + result.stderr)
+    (OUT / 'TEST-RESULTS.txt').write_text('CM Astra 2.7; 26.11.2026\n' + '\n'.join(results) + ('\nReal Tk UI tests ran on ' + sys.platform + ' with an actual desktop session. This is not Windows/Astra pilot validation.\n' if '--ui-tests' in sys.argv else '\nReal Tk UI tests were not run in this build; run test_cm_ui.py in a desktop session.\n') + '\nTests use fake SSH/SFTP and platform vault APIs. Teacher-clock synchronization protocol is tested with a stub clock_settime; no system clocks were changed. Real Astra SSH/sudo time synchronization is pending. Selected remote command stop is exercised with real local Python/Bash process groups (SSH/sudo mocked). Selective per-host cancellation, parallel command dispatch, independent concurrent operations, per-host release, exit confirmation/cancellation, parallel multi-file distribution and live command output/heartbeat/redaction are covered; local Bash validates directory quoting. No power commands or installations sent to school PCs. Real Windows/Astra GUI and vault validation pending.\n')
+    files = sorted(p for p in OUT.rglob('*') if p.is_file() and '__pycache__' not in p.parts and not any(x.startswith('.venv') for x in p.parts) and p.name != 'SHA256SUMS.txt')
+    (OUT / 'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.relative_to(OUT).as_posix() + '\n' for p in files))
+    for name in ['CM-Astra-2.7-school-distribution.zip', 'CM-Astra-Windows.zip', 'CM-Astra-AstraLinux.zip']:
+        archive = OUTPUTS / name
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
+            for p in files + [OUT / 'SHA256SUMS.txt']:
+                z.write(p, 'CM-Astra/' + p.relative_to(OUT).as_posix())
+        with zipfile.ZipFile(archive) as z:
+            assert z.testzip() is None
+            for p in files:
+                assert z.read('CM-Astra/' + p.relative_to(OUT).as_posix()) == p.read_bytes()
+        print('Built and tested', archive)
