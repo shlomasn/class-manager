@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan, mac_address, wake_plan, collect_mac, wake_computer
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, load_profile_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan, mac_address, wake_plan, collect_mac, wake_computer
 import credential_store
 import cm_ui
 
@@ -92,16 +92,18 @@ class Manager:
         self.host_file = self.data / 'computers.json'
         self.trust_file = self.data / 'trusted-keys.json'
         self.inventory_file = self.data / 'inventory.json'
-        self.network_file = self.data / 'network.json'
-        saved_domain = dns_domain(json.loads(self.network_file.read_text()).get('domain', '')) if self.network_file.exists() else None
+        legacy_network = self.data / 'network.json'
         if self.inventory_file.exists():
-            self.rooms, self.hosts = load_inventory(self.inventory_file, default_domain=saved_domain or '')
+            self.rooms, self.hosts, self.domain = load_profile_inventory(
+                self.inventory_file, legacy_network=legacy_network)
         else:
             self.hosts = load_hosts(self.host_file if self.host_file.exists() else ROOT / 'computers.json')
-            if saved_domain is not None and self.host_file.exists():
-                self.hosts = [replace(host, domain=saved_domain) if not host.domain else host for host in self.hosts]
             self.rooms = sorted({host.room for host in self.hosts})
-        self.domain = saved_domain if saved_domain is not None else (self.hosts[0].domain if self.hosts else '')
+            self.domain = self.hosts[0].domain if self.hosts else ''
+            if legacy_network.exists():
+                self.domain = dns_domain(json.loads(legacy_network.read_text(encoding='utf-8')).get('domain', ''))
+                if self.host_file.exists():
+                    self.hosts = [replace(host, domain=self.domain) if not host.domain else host for host in self.hosts]
         self.catalog = json.loads((ROOT / 'key-catalog.json').read_text(encoding='utf-8'))
         self.trusted = json.loads(self.trust_file.read_text(encoding='utf-8')) if self.trust_file.exists() else {}
         self.trusted = {value.get('name', key): value for key, value in self.trusted.items()}
@@ -183,6 +185,10 @@ class Manager:
         self.menu_action(rooms, 'Добавить кабинет…', self.add_room, inventory=True)
         self.menu_action(rooms, 'Удалить текущий кабинет…', self.remove_room, inventory=True)
         menu.add_separator()
+        profile = tk.Menu(menu, tearoff=False)
+        menu.add_cascade(label='Данные школы', menu=profile)
+        self.menu_action(profile, 'Сохранить копию…', self.export_profile, inventory=True)
+        self.menu_action(profile, 'Восстановить из копии…', self.restore_profile, inventory=True)
         self.menu_action(menu, 'Настройки сети…', self.network_settings, inventory=True)
         self.menu_action(menu, 'Сохранить / изменить пароль…', self.save_password)
         self.menu_action(menu, 'Забыть сохранённый пароль', self.forget_password)
@@ -499,6 +505,44 @@ class Manager:
         self.selected.clear()
         self.refresh()
 
+    def export_profile(self):
+        path = filedialog.asksaveasfilename(parent=self.window, title='Копия данных школы',
+            initialfile='CM-school-backup.json', defaultextension='.json', filetypes=[('JSON CM', '*.json')])
+        if not path:
+            return
+        try:
+            save_inventory(path, self.rooms, self.hosts, domain=self.domain)
+        except Exception as error:
+            messagebox.showerror('Копия не сохранена', str(error), parent=self.window)
+            return
+        self.summary.set('Копия данных школы сохранена: ' + Path(path).name)
+
+    def restore_profile(self):
+        path = filedialog.askopenfilename(parent=self.window, title='Восстановить данные школы',
+            filetypes=[('JSON CM', '*.json')])
+        if not path:
+            return
+        try:
+            rooms, hosts, domain = load_profile_inventory(path)
+            preview = f'Файл: {Path(path).name}\nКабинетов: {len(rooms)}\nКомпьютеров: {len(hosts)}\nДомен: {domain or "не задан"}'
+            if not messagebox.askokcancel('Заменить данные школы?', preview +
+                    '\n\nТекущие кабинеты, список ПК и домен будут заменены.',
+                    default='cancel', parent=self.window):
+                return
+            save_inventory(self.inventory_file, rooms, hosts, domain=domain)
+        except Exception as error:
+            messagebox.showerror('Данные не восстановлены', str(error), parent=self.window)
+            return
+        self.rooms, self.hosts, self.domain = rooms, hosts, domain
+        self.last_results = []
+        self.last_upload_directory = None
+        self.last_ips.clear()
+        self.selected.clear()
+        self.statuses.clear()
+        self.room.set('Все кабинеты')
+        self.refresh()
+        self.summary.set('Данные школы восстановлены: ' + Path(path).name)
+
     def import_list(self):
         path = filedialog.askopenfilename(parent=self.window, title='Список компьютеров CM', filetypes=[('Списки CM', '*.lst *.json *.csv'), ('Все файлы', '*.*')])
         if not path:
@@ -513,7 +557,7 @@ class Manager:
             else:
                 rows = load_hosts(path)
                 rooms = sorted({host.room for host in rows})
-            save_inventory(self.inventory_file, rooms, rows)
+            save_inventory(self.inventory_file, rooms, rows, domain=self.domain)
             self.hosts = rows
             self.rooms = rooms
             self.last_ips.clear()
@@ -541,7 +585,7 @@ class Manager:
                 '\n' + preview + '\n\nПароли не импортируются. Для этих ПК используются индивидуальные учётные записи. Остальные ПК сохраняются.',
                 default='cancel', parent=self.window):
             return
-        save_inventory(self.inventory_file, rooms, hosts)
+        save_inventory(self.inventory_file, rooms, hosts, domain=self.domain)
         self.rooms, self.hosts = rooms, hosts
         self.selected.clear()
         self.last_ips.clear()
@@ -562,10 +606,9 @@ class Manager:
         try:
             domain = dns_domain(value)
             hosts = [replace(host, domain=domain) for host in self.hosts]
-            save_inventory(self.inventory_file, self.rooms, hosts)
+            save_inventory(self.inventory_file, self.rooms, hosts, domain=domain)
             self.hosts = hosts
             self.domain = domain
-            atomic_json(self.network_file, dict(version=1, domain=domain))
             self.last_ips.clear()
             self.statuses.clear()
             self.refresh()
@@ -573,7 +616,7 @@ class Manager:
             messagebox.showerror('Настройки сети', str(error), parent=self.window)
 
     def persist(self):
-        save_inventory(self.inventory_file, self.rooms, self.hosts)
+        save_inventory(self.inventory_file, self.rooms, self.hosts, domain=self.domain)
 
     def add_room(self):
         value = simpledialog.askstring('Добавить класс', 'Название класса, например 208:', parent=self.window)
@@ -583,7 +626,7 @@ class Manager:
             name = room_name(value)
             if name in self.rooms:
                 raise ValueError('Такой класс уже есть')
-            save_inventory(self.inventory_file, self.rooms + [name], self.hosts)
+            save_inventory(self.inventory_file, self.rooms + [name], self.hosts, domain=self.domain)
             self.rooms.append(name)
             self.room.set(name)
             self.change_room()
@@ -601,7 +644,7 @@ class Manager:
         try:
             rooms = [value for value in self.rooms if value != room]
             hosts = [host for host in self.hosts if host.room != room]
-            save_inventory(self.inventory_file, rooms, hosts)
+            save_inventory(self.inventory_file, rooms, hosts, domain=self.domain)
             self.rooms, self.hosts = rooms, hosts
             self.room.set('Все кабинеты')
             self.change_room()
@@ -678,7 +721,7 @@ class Manager:
                     credential_store.save(password.get(), updated.username, updated.name)
                 elif erase.get():
                     credential_store.delete(updated.username, updated.name)
-                save_inventory(self.inventory_file, self.rooms, hosts)
+                save_inventory(self.inventory_file, self.rooms, hosts, domain=self.domain)
                 password.set('')
                 self.hosts = hosts
                 self.selected.clear()
@@ -705,7 +748,7 @@ class Manager:
             return
         try:
             hosts = [host for host in self.hosts if host.name not in targets]
-            save_inventory(self.inventory_file, self.rooms, hosts)
+            save_inventory(self.inventory_file, self.rooms, hosts, domain=self.domain)
             self.hosts = hosts
             self.selected.clear()
             self.refresh()
@@ -779,7 +822,7 @@ class Manager:
         def save():
             try:
                 hosts = [replace(h, room=destination.get() if h.name in targets else h.room) for h in self.hosts]
-                save_inventory(self.inventory_file, self.rooms, hosts)
+                save_inventory(self.inventory_file, self.rooms, hosts, domain=self.domain)
                 self.hosts = hosts
                 self.selected.clear()
                 self.refresh()
@@ -1214,7 +1257,7 @@ class Manager:
                 new_rooms = list(self.rooms)
                 if destination.get() not in new_rooms:
                     new_rooms.append(destination.get())
-                save_inventory(self.inventory_file, new_rooms, hosts)
+                save_inventory(self.inventory_file, new_rooms, hosts, domain=self.domain)
                 atomic_json(self.trust_file, new_trust)
                 self.hosts, self.rooms, self.trusted = hosts, new_rooms, new_trust
                 self.selected.clear()
@@ -1332,7 +1375,7 @@ class Manager:
             return ''
         try:
             hosts = [replace(host, mac=values[host.name]['mac'], wol_broadcast=values[host.name]['wol_broadcast'], mac_type=values[host.name].get('mac_type', ''), mac_interface=values[host.name].get('interface', '')) if host.name in values else host for host in self.hosts]
-            save_inventory(self.inventory_file, self.rooms, hosts)
+            save_inventory(self.inventory_file, self.rooms, hosts, domain=self.domain)
             self.hosts = hosts
             return ' MAC и адреса рассылки сохранены.'
         except Exception:

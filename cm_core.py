@@ -215,23 +215,36 @@ def resolve(host):
 
 
 def load_inventory(path, default_domain=''):
-    data = json.loads(Path(path).read_text(encoding='utf-8'))
-    if data.get('version') != 2:
+    rooms, hosts, _ = load_profile_inventory(path, default_domain=default_domain)
+    return rooms, hosts
+
+
+def load_profile_inventory(path, default_domain=None, legacy_network=None):
+    data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    if not isinstance(data, dict) or data.get('version') != 2:
         raise ValueError('Неизвестная версия списка')
+    if 'domain' in data:
+        domain = dns_domain(data['domain'])
+    elif legacy_network is not None and legacy_network.exists():
+        domain = dns_domain(json.loads(legacy_network.read_text(encoding='utf-8')).get('domain', ''))
+    else:
+        domain = default_domain
     rooms = [room_name(value) for value in data['rooms']]
     if len(rooms) != len(set(rooms)) or len(rooms) > 100:
         raise ValueError('Повторные классы или более 100 классов')
     rows = data['hosts']
     for row in rows:
-        row.setdefault('domain', default_domain)  # Legacy entries can use the profile's configured domain.
+        row.setdefault('domain', domain or '')  # Legacy entries can use the profile's configured domain.
     hosts = validate_hosts(rows)
     if any(host.room not in rooms for host in hosts):
         raise ValueError('Компьютер ссылается на отсутствующий класс')
-    return rooms, hosts
+    return rooms, hosts, domain if domain is not None else (hosts[0].domain if hosts else '')
 
 
-def save_inventory(path, rooms, hosts):
+def save_inventory(path, rooms, hosts, *, domain=None):
     payload = dict(version=2, rooms=rooms, hosts=[asdict(host) for host in hosts])
+    if domain is not None:
+        payload['domain'] = dns_domain(domain)
     # Validate before replacing a valid configuration.
     validated = validate_hosts(payload['hosts'])
     clean_rooms = [room_name(value) for value in rooms]

@@ -153,6 +153,7 @@ class InterfaceTests(unittest.TestCase):
     def app(self):
         app = gui.Manager.__new__(gui.Manager)
         app.window = object()
+        app.domain = ''
         app.selected = {'a702-06'}
         app.statuses, app.trusted, app.catalog, app.last_ips = {}, {}, {}, {}
         app.credential_status = types.SimpleNamespace(set=lambda text: None)

@@ -337,10 +337,47 @@ class WorkbenchTests(unittest.TestCase):
             with patch.object(gui.simpledialog,'askstring',return_value=value):
                 app.network_settings()
             self.assertTrue(all(h.domain==value for h in app.hosts))
-            self.assertEqual(json.loads(app.network_file.read_text())['domain'],value)
+            self.assertEqual(json.loads(app.inventory_file.read_text())['domain'],value)
             self.assertEqual([(h.name,h.username,h.credential_mode) for h in app.hosts],before)
             self.assertEqual(app.trusted['pc-01']['key'],'test-key')
         self.assertTrue(all(h.domain=='' for h in core.load_inventory(app.inventory_file)[1]))
+
+    def test_school_backup_restores_legacy_profile_in_one_file(self):
+        from dataclasses import replace
+        original = self.app
+        host = replace(original.hosts[0], domain='lab.example', mac='02:11:22:33:44:55')
+        legacy = original.data / 'network.json'
+        legacy.write_text('{"version": 1, "domain": "school.example"}')
+        core.save_inventory(original.inventory_file, ['Пустой кабинет', host.room], [host])
+        old_window = tk.Toplevel(self.root)
+        old = gui.Manager(old_window, data=original.data)
+        self.assertEqual(old.domain, 'school.example')
+        self.assertEqual(old.hosts, [host])
+
+        copy = original.data / 'school-backup.json'
+        with patch.object(gui.filedialog, 'asksaveasfilename', return_value=str(copy)):
+            old.export_profile()
+        old.closing = True
+        old_window.destroy()
+
+        with patch.object(gui.filedialog, 'askopenfilename', return_value=str(copy)):
+            with patch.object(gui.messagebox, 'askokcancel', return_value=False):
+                original.restore_profile()
+            self.assertNotEqual(original.hosts, [host])
+            with patch.object(gui.messagebox, 'askokcancel', return_value=True):
+                original.restore_profile()
+        self.assertEqual(original.rooms, ['Пустой кабинет', host.room])
+        self.assertEqual(original.hosts, [host])
+        self.assertEqual(original.domain, 'school.example')
+
+        # A stale legacy file must not override the domain restored from the copy.
+        legacy.write_text('{"domain": "stale.example"}')
+        reopened = tk.Toplevel(self.root)
+        fresh = gui.Manager(reopened, data=original.data)
+        self.assertEqual((fresh.rooms, fresh.hosts, fresh.domain),
+                         (original.rooms, original.hosts, original.domain))
+        fresh.closing = True
+        reopened.destroy()
 
     def test_fresh_installation_can_start_without_school_computers(self):
         home = Path(self.temp.name) / 'clean-home'
