@@ -1,5 +1,6 @@
 """Class Manager for a Windows teacher computer controlling Astra over SSH."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, replace
 import datetime
 import json
 import os
@@ -13,11 +14,22 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv
 import credential_store
 import cm_ui
 
 ROOT = Path(__file__).resolve().parent
+
+
+def password_for(passwords, name):
+    return passwords[name] if isinstance(passwords, dict) else passwords
+
+
+def hide_passwords(text, passwords):
+    values = passwords.values() if isinstance(passwords, dict) else [passwords]
+    for value in sorted(set(v for v in values if v), key=len, reverse=True):
+        text = text.replace(value, '[СКРЫТО]')
+    return text
 
 
 def data_directory():
@@ -99,7 +111,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.1 — управление школьными компьютерами')
+        window.title('CM Astra 2.2 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -154,7 +166,7 @@ class Manager:
         menu.add_cascade(label='Компьютеры', menu=computers)
         for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
                               ('Удалить отмеченные ПК…', self.remove_hosts), ('Перенести отмеченные в кабинет…', self.move_hosts),
-                              ('Открыть список .lst / .json…', self.import_list), ('Найти ПК по IP…', self.scan_range)]:
+                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Найти ПК по IP…', self.scan_range)]:
             self.menu_action(computers, text, command, inventory=True)
         rooms = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Кабинеты', menu=rooms)
@@ -172,7 +184,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.1 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.2 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -457,10 +469,13 @@ class Manager:
         self.refresh()
 
     def import_list(self):
-        path = filedialog.askopenfilename(parent=self.window, title='Список компьютеров CM', filetypes=[('Списки CM', '*.lst *.json'), ('Все файлы', '*.*')])
+        path = filedialog.askopenfilename(parent=self.window, title='Список компьютеров CM', filetypes=[('Списки CM', '*.lst *.json *.csv'), ('Все файлы', '*.*')])
         if not path:
             return
         try:
+            if Path(path).suffix.lower() == '.csv':
+                self.import_csv(path)
+                return
             raw = json.loads(Path(path).read_text(encoding='utf-8')) if Path(path).suffix.lower() == '.json' else None
             if isinstance(raw, dict) and raw.get('version') == 2:
                 rooms, rows = load_inventory(path)
@@ -478,6 +493,31 @@ class Manager:
             self.summary.set('Загружен список: ' + Path(path).name)
         except Exception as error:
             messagebox.showerror('Список не загружен', str(error), parent=self.window)
+
+    def import_csv(self, path):
+        incoming = load_csv(path)
+        current = {host.name: host for host in self.hosts}
+        for host in incoming:
+            old = current.get(host.name)
+            current[host.name] = replace(old, room=host.room, username=host.username,
+                credential_mode='host') if old else host
+        hosts = list(current.values())
+        rooms = sorted(set(self.rooms) | {host.room for host in incoming})
+        # Validate the entire merge before asking for confirmation or saving.
+        validate_hosts([asdict(host) for host in hosts])
+        preview = '\n'.join(host.room + ' / ' + host.name + ' / ' + host.username for host in incoming)
+        if not messagebox.askokcancel('Импорт CSV', 'Добавить или обновить ПК: ' + str(len(incoming)) +
+                '\n' + preview + '\n\nПароли не импортируются. Для этих ПК используются индивидуальные учётные записи. Остальные ПК сохраняются.',
+                default='cancel', parent=self.window):
+            return
+        save_inventory(self.inventory_file, rooms, hosts)
+        self.rooms, self.hosts = rooms, hosts
+        self.selected.clear()
+        self.last_ips.clear()
+        self.statuses.clear()
+        self.room.set('Все кабинеты')
+        self.refresh()
+        self.summary.set('CSV импортирован. Пароли задаются в карточках ПК или при подключении.')
 
     def persist(self):
         save_inventory(self.inventory_file, self.rooms, self.hosts)
@@ -540,11 +580,18 @@ class Manager:
         room = tk.StringVar(value=original.room if original else selected_room)
         mode = tk.StringVar(value='По имени (DHCP / DNS)' if not original or original.mode == 'dns' else 'Постоянный IP')
         ip = tk.StringVar(value=original.ip if original and original.mode == 'fixed' else '')
+        username = tk.StringVar(value=original.username if original else 'user')
+        password = tk.StringVar()
+        credentials = tk.StringVar(value='Общий user' if not original or original.credential_mode == 'shared' else 'Для этого ПК')
+        erase = tk.BooleanVar(value=False)
         for row, (label, widget) in enumerate([
             ('Имя ПК:', ttk.Entry(frame, textvariable=name, width=42)),
             ('Класс:', ttk.Combobox(frame, textvariable=room, values=sorted(self.rooms), state='readonly', width=39)),
             ('Адресация:', ttk.Combobox(frame, textvariable=mode, values=('По имени (DHCP / DNS)', 'Постоянный IP'), state='readonly', width=39)),
-            ('Постоянный IP:', ttk.Entry(frame, textvariable=ip, width=42))]):
+            ('Постоянный IP:', ttk.Entry(frame, textvariable=ip, width=42)),
+            ('Логин SSH:', ttk.Entry(frame, textvariable=username, width=42)),
+            ('Пароль:', ttk.Entry(frame, textvariable=password, show='*', width=42)),
+            ('Учётная запись:', ttk.Combobox(frame, textvariable=credentials, values=('Общий user', 'Для этого ПК'), state='readonly', width=39))]):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
             widget.grid(row=row, column=1, sticky='ew', pady=6)
             if row == 0:
@@ -555,15 +602,25 @@ class Manager:
             ip_entry.configure(state='disabled' if mode.get().startswith('По имени') else 'normal')
         frame.grid_slaves(row=2, column=1)[0].bind('<<ComboboxSelected>>', mode_changed)
         mode_changed()
-        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя в домене 534school.spb.ru через школьный DNS.').grid(row=4, columnspan=2, sticky='w', pady=12)
+        ttk.Label(frame, text='Пример: a208-02. Для DHCP программа каждый раз ищет\nимя в домене 534school.spb.ru через школьный DNS.').grid(row=7, columnspan=2, sticky='w', pady=12)
+        ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=8, columnspan=2, sticky='w')
+        ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=9, columnspan=2, sticky='w', pady=8)
         def save():
             try:
                 dns = mode.get().startswith('По имени')
-                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed')
-                rows = [dict(name=h.name, room=h.room, ip=h.ip, mode=h.mode) for h in self.hosts if original is None or h.name != original.name]
+                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared')
+                rows = [asdict(h) for h in self.hosts if original is None or h.name != original.name]
                 rows.append(candidate)
                 hosts = validate_hosts(rows)
+                updated = next(h for h in hosts if h.name == candidate['name'])
+                if password.get() and erase.get():
+                    raise ValueError('Выберите замену или удаление пароля')
+                if password.get():
+                    credential_store.save(password.get(), updated.username, updated.name)
+                elif erase.get():
+                    credential_store.delete(updated.username, updated.name)
                 save_inventory(self.inventory_file, self.rooms, hosts)
+                password.set('')
                 self.hosts = hosts
                 self.selected.clear()
                 self.last_ips.clear()
@@ -573,7 +630,7 @@ class Manager:
             except Exception as error:
                 messagebox.showerror('Компьютер не сохранён', str(error), parent=dialog)
         bar = ttk.Frame(frame)
-        bar.grid(row=5, columnspan=2, sticky='ew')
+        bar.grid(row=10, columnspan=2, sticky='ew')
         ttk.Button(bar, text='Сохранить', command=save).pack(side='left')
         ttk.Button(bar, text='Отмена', command=dialog.destroy).pack(side='right')
         dialog.grab_set()
@@ -622,6 +679,31 @@ class Manager:
             return password
         return simpledialog.askstring('Пароль администратора', 'Общий пароль локального user на выбранных ПК:\nДля сохранения используйте кнопку «Сохранить / изменить пароль».', show='*', parent=self.window)
 
+    def get_host_passwords(self, hosts):
+        if all(host.credential_mode == 'shared' for host in hosts):
+            return self.get_password()
+        passwords = {}
+        shared = None
+        try:
+            for host in hosts:
+                if host.credential_mode == 'shared':
+                    if shared is None:
+                        shared = self.get_password()
+                    secret = shared
+                else:
+                    secret = credential_store.load(host.username, host.name)
+                    if not secret:
+                        secret = simpledialog.askstring('Пароль для ПК', host.name + ' — логин ' + host.username +
+                            '\nПароль для этой операции (сохранить можно в карточке ПК):', show='*', parent=self.window)
+                if not secret:
+                    return None
+                credential_store.validate(secret)
+                passwords[host.name] = secret
+            return passwords
+        except Exception:
+            messagebox.showerror('Учётные записи', 'Не удалось получить пароль из системного хранилища. Проверьте связку ключей и карточку ПК.', parent=self.window)
+            return None
+
     def move_hosts(self):
         targets = {host.name for host in self.visible() if host.name in self.selected}
         if not targets:
@@ -637,7 +719,7 @@ class Manager:
         ttk.Combobox(frame, textvariable=destination, values=sorted(self.rooms), state='readonly', width=35).pack(pady=10)
         def save():
             try:
-                hosts = [Host(h.name, h.ip, destination.get() if h.name in targets else h.room, h.mode) for h in self.hosts]
+                hosts = [replace(h, room=destination.get() if h.name in targets else h.room) for h in self.hosts]
                 save_inventory(self.inventory_file, self.rooms, hosts)
                 self.hosts = hosts
                 self.selected.clear()
@@ -661,9 +743,9 @@ class Manager:
         destination = simpledialog.askstring(
             'Куда передать файлы на ученических ПК?',
             'Папка НА УЧЕНИЧЕСКИХ ПК (одинаковый путь для всех выбранных):\n'
-            '~/ — домашняя папка user; можно указать /полный/путь.\n'
+            '~/ — домашняя папка выбранного пользователя; можно указать /полный/путь.\n'
             'Недостающие папки будут созданы. При совпадении имени будет вопрос о перезаписи.\n'
-            'Передача не запускает файлы. Права записи — у user.',
+            'Передача не запускает файлы. Права записи — у выбранного пользователя.',
             initialvalue=DEFAULT_INBOX, parent=self.window)
         if destination is None:
             return
@@ -802,7 +884,7 @@ class Manager:
         text = tk.Text(frame, width=85, height=10, wrap='word')
         text.insert('1.0', preset['script'] if preset else 'hostname; uptime')
         text.pack(fill='both', expand=True, pady=10)
-        ttk.Label(frame, text='Рабочая папка НА УЧЕНИЧЕСКИХ ПК (~ — домашняя папка user):').pack(anchor='w')
+        ttk.Label(frame, text='Рабочая папка НА УЧЕНИЧЕСКИХ ПК (~ — домашняя папка выбранного пользователя):').pack(anchor='w')
         cwd = tk.StringVar(value=preset['cwd'] if preset else '~')
         ttk.Entry(frame, textvariable=cwd, width=85, state='readonly' if preset else 'normal').pack(fill='x', pady=4)
         if preset:
@@ -917,7 +999,7 @@ class Manager:
                     break
             self.events.put(('range_inspected', results))
         except Exception as error:
-            self.events.put(('error', str(error).replace(password, '[СКРЫТО]')))
+            self.events.put(('error', hide_passwords(str(error), password)))
         finally:
             password = None
 
@@ -976,7 +1058,8 @@ class Manager:
                 new_trust = dict(self.trusted)
                 for row in candidates:
                     if row['name'] in selected:
-                        hosts.append(Host(row['name'], row['ip'], destination.get(), row['mode']))
+                        old = next((h for h in self.hosts if h.name == row['name']), None)
+                        hosts.append(replace(old, ip=row['ip'], room=destination.get(), mode=row['mode']) if old else Host(row['name'], row['ip'], destination.get(), row['mode']))
                         new_trust[row['name']] = {key: row[key] for key in ('type', 'key', 'fingerprint', 'name')}
                 new_rooms = list(self.rooms)
                 if destination.get() not in new_rooms:
@@ -1149,25 +1232,26 @@ class Manager:
             text += ('\n\nНЕМЕДЛЕННО, без возможности отмены после выполнения.' if minutes == 0 else '\n\nЧерез ' + str(minutes) + ' мин. после отправки каждому ПК.')
             text += ' Несохранённые данные будут потеряны.'
         if action == 'distribute':
-            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in job['files']) + '\nПапка на ученических ПК: ' + job['destination'] + '\n~ — домашняя папка user. При совпадении имени будет вопрос о перезаписи. Автоматического запуска нет.'
+            text += '\n\nФайлы: ' + ', '.join(Path(value).name for value in job['files']) + '\nПапка на ученических ПК: ' + job['destination'] + '\n~ — домашняя папка выбранного пользователя. При совпадении имени будет вопрос о перезаписи. Автоматического запуска нет.'
         if action == 'command':
-            text += '\n\n' + ('ПРАВА ROOT (sudo)' if job['sudo'] else 'Права локального user') + '\nРабочая папка: ' + job['cwd'] + '\n' + job['script'][:2000]
+            text += '\n\n' + ('ПРАВА ROOT (sudo)' if job['sudo'] else 'Права выбранного пользователя') + '\nРабочая папка: ' + job['cwd'] + '\n' + job['script'][:2000]
         if action == 'distribute':
             text += '\nФайлы раздаются всем выбранным ПК параллельно. После передачи проверяется SHA-256.'
         if action == 'command' and job.get('targets'):
             text += '\n\nПроверка SHA-256 и запуск файлов:\n' + '\n'.join(row['name'] + ': ' + job['targets'][row['name']]['expected_file']['path'] for row in permitted)
+        text += '\n\nУчётные записи SSH:\n' + '\n'.join(row['name'] + ': ' + host_map[row['name']].username for row in permitted)
         if initial_results:
             text += '\n\nНедоступные или заблокированные ПК пропущены: ' + str(len(initial_results)) + '.'
         if not messagebox.askokcancel('Подтверждение команды учителя', text, icon='warning', default='cancel', parent=self.window):
             finish()
             self.summary.set('Отменено. Команды питания не отправлялись.')
             return
-        password = self.get_password()
+        password = self.get_host_passwords([host_map[row['name']] for row in permitted])
         if not password:
             finish()
             self.summary.set('Отменено. Команды питания не отправлялись.')
             return
-        if '\n' in password or '\r' in password:
+        if isinstance(password, str) and ('\n' in password or '\r' in password):
             finish()
             messagebox.showerror('Пароль', 'Пароль не должен содержать перевод строки.', parent=self.window)
             return
@@ -1243,6 +1327,7 @@ class Manager:
         events.put(('distribution_started', [pin['name'] for pin in rows]))
         def worker(pin):
             name = pin['name']
+            secret = password_for(password, name)
             worker_control = host_controls.get(name, control)
             last_update = 0
             last_phase = None
@@ -1264,12 +1349,12 @@ class Manager:
                     except queue.Empty:
                         continue
             try:
-                result = transfer_files(host_map[name], pin, password, job['files'], batch,
+                result = transfer_files(host_map[name], pin, secret, job['files'], batch,
                                         destination=job['destination'], progress=progress,
                                         on_conflict=on_conflict, access_gate=gate, prepared=prepared, **(dict(control=worker_control) if worker_control else {}))
             except Exception as error:
                 result = dict(name=name, ip=pin['ip'], action='upload', ok=False,
-                              message=str(error).replace(password, '[СКРЫТО]'))
+                              message=hide_passwords(str(error), password))
                 if isinstance(error, OperationCancelled):
                     result['cancelled'] = True
             result['requested_destination'] = job['destination']
@@ -1298,17 +1383,18 @@ class Manager:
         events.put(('command_waiting', [pin['name'] for pin in rows]))
         def worker(pin):
             name = pin['name']
+            secret = password_for(password, name)
             target = job.get('targets', {}).get(name, {})
             worker_control = host_controls.get(name, control)
             options = dict(control=worker_control) if worker_control else {}
             try:
-                result = execute_command(host_map[name], pin, password, job['script'], job['sudo'], job['timeout'],
+                result = execute_command(host_map[name], pin, secret, job['script'], job['sudo'], job['timeout'],
                                          cwd=target.get('cwd', job.get('cwd', '~')), expected_file=target.get('expected_file'),
                                          progress=lambda value: events.put(('command_progress', dict(value, name=name))),
                                          access_gate=gate, **options)
             except Exception as error:
                 result = dict(name=name, ip=pin['ip'], action='command', ok=False,
-                              message=str(error).replace(password, '[СКРЫТО]'))
+                              message=hide_passwords(str(error), password))
             if result.get('stop'):
                 gate.stopped.set()
             events.put(('result', result))
@@ -1325,13 +1411,14 @@ class Manager:
         host_controls = host_controls or {}
         def worker(pin):
             name = pin['name']
+            secret = password_for(password, name)
             worker_control = host_controls.get(name, control)
             try:
-                result = synchronize_time(host_map[name], pin, password,
+                result = synchronize_time(host_map[name], pin, secret,
                                           progress=lambda value: events.put(('command_progress', dict(value, name=name))),
                                           control=worker_control, access_gate=gate)
             except Exception as error:
-                result = dict(name=name, ip=pin['ip'], action='time_sync', ok=False, message=str(error).replace(password, '[СКРЫТО]'))
+                result = dict(name=name, ip=pin['ip'], action='time_sync', ok=False, message=hide_passwords(str(error), password))
             if result.get('stop'):
                 gate.stopped.set()
             events.put(('result', result))
@@ -1359,7 +1446,7 @@ class Manager:
                     control.check()
                 label = pin['name'] + ' • ПК ' + str(index + 1) + '/' + str(len(rows))
                 events.put(('operation_status', label + ': подключение и проверка имени/ОС…'))
-                result = execute(host_map[pin['name']], pin, password, action, minutes, **options)
+                result = execute(host_map[pin['name']], pin, password_for(password, pin['name']), action, minutes, **options)
                 results.append(result)
                 events.put(('result', result))
                 if result.get('stop'):
@@ -1372,7 +1459,7 @@ class Manager:
             atomic_json(report, results)
             events.put(('finished', (results, str(report))))
         except Exception as error:
-            events.put(('error', str(error).replace(password, '[СКРЫТО]')))
+            events.put(('error', hide_passwords(str(error), password)))
         finally:
             password = None
 

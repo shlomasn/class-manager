@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import paramiko
 import cm_core as core
@@ -1367,6 +1367,134 @@ time.time = lambda: _clock[0]
         result = subprocess.run([sys.executable, '-c', prefix + core.time_sync_script(token)], input=bad, capture_output=True, text=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('CM_TIME_RESULT:', result.stdout)
+
+
+
+class PerHostAccountTests(unittest.TestCase):
+    def test_legacy_inventory_defaults_and_roundtrip(self):
+        from dataclasses import asdict
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'inventory.json'
+            hosts = core.validate_hosts([dict(name='pc-01', room='208'),
+                dict(name='pc-02', room='208', username='admin', credential_mode='host')])
+            self.assertEqual((hosts[0].username, hosts[0].credential_mode), ('user', 'shared'))
+            core.save_inventory(path, ['208'], hosts)
+            self.assertEqual(core.load_inventory(path), (['208'], hosts))
+            self.assertNotIn('password', path.read_text())
+            for login in ('bad name', '-root', 'a\nroot', 'a;echo'):
+                with self.assertRaises(ValueError):
+                    core.validate_hosts([dict(name='pc-01', username=login)])
+            with self.assertRaises(ValueError):
+                core.validate_hosts([dict(name='pc-01', username='admin', credential_mode='shared')])
+
+    def test_csv_encodings_duplicates_and_secret_columns(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'input.csv'
+            for encoding in ('utf-8-sig', 'cp1251'):
+                path.write_bytes('кабинет;компьютер;логин\n208;pc-01;admin\n209;pc-02;\n'.encode(encoding))
+                hosts = core.load_csv(path)
+                self.assertEqual([(h.room,h.name,h.username,h.credential_mode) for h in hosts],
+                    [('208','pc-01','admin','host'),('209','pc-02','user','host')])
+            for text in ('кабинет;компьютер;логин;пароль\n208;pc-01;admin;secret',
+                'кабинет;компьютер;логин\n208;pc-01;admin;secret',
+                'кабинет;компьютер;логин\n208;pc-01;admin\n209;PC-01;user',
+                'кабинет;компьютер;логин\n'):
+                path.write_text(text)
+                with self.assertRaises(ValueError):
+                    core.load_csv(path)
+
+    def test_scoped_secret_service_and_legacy_key(self):
+        self.assertEqual(store.target_name(), store.TARGET)
+        keys = {store.target_name(login, host) for host in ('pc-01','pc-02') for login in ('user','admin')}
+        self.assertEqual(len(keys), 4)
+        self.assertNotIn(store.TARGET, keys)
+        with patch.object(store, 'os', types.SimpleNamespace(name='posix')), patch.object(store.shutil, 'which', return_value='/usr/bin/secret-tool'), patch.object(store.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout='secret')) as run:
+            store.save('private', 'admin', 'pc-01')
+            args = run.call_args.args[0]
+            self.assertEqual(args[-4:], ['account','admin','host','pc-01'])
+            self.assertNotIn('private', args)
+            self.assertEqual(run.call_args.kwargs['input'], 'private')
+            self.assertEqual(store.load('admin', 'pc-01'), 'secret')
+            store.delete('admin', 'pc-02')
+            self.assertEqual(run.call_args.args[0][-1], 'pc-02')
+
+    def test_each_worker_receives_its_own_password(self):
+        import queue
+        import class_manager as gui
+        app = gui.Manager.__new__(gui.Manager)
+        hosts = {h.name:h for h in (core.Host('pc-01','','208','dns','admin','host'),
+                                    core.Host('pc-02','','208'))}
+        pins = [dict(name=name,ip='192.168.22.1') for name in hosts]
+        secrets = {'pc-01':'first-secret','pc-02':'shared-secret'}
+        calls = {}
+        def execute(host,pin,password,*args,**kwargs):
+            calls[host.name] = (host.username,password)
+            return dict(name=host.name,ok=True)
+        with patch.object(gui,'execute_command',side_effect=execute):
+            app.send_commands(hosts,pins,secrets,dict(script='date',sudo=False,timeout=30),queue.Queue())
+        self.assertEqual(calls,{'pc-01':('admin','first-secret'),'pc-02':('user','shared-secret')})
+        with patch.object(gui,'synchronize_time',side_effect=execute):
+            app.send_time_sync(hosts,pins,secrets,queue.Queue())
+        self.assertEqual(calls['pc-01'][1], 'first-secret')
+        self.assertEqual(gui.hide_passwords('first-secret shared-secret', secrets), '[СКРЫТО] [СКРЫТО]')
+
+    def test_password_collection_no_shared_fallback_for_individual(self):
+        import class_manager as gui
+        app = gui.Manager.__new__(gui.Manager)
+        app.window = None
+        app.get_password = Mock(return_value='shared')
+        hosts = [core.Host('pc-01','','208','dns','admin','host'),core.Host('pc-02','','208')]
+        with patch.object(gui.credential_store,'load',return_value='individual') as load:
+            values = app.get_host_passwords(hosts)
+        self.assertEqual(values,{'pc-01':'individual','pc-02':'shared'})
+        load.assert_called_once_with('admin','pc-01')
+        with patch.object(gui.credential_store,'load',return_value=None), patch.object(gui.simpledialog,'askstring',return_value=None):
+            self.assertIsNone(app.get_host_passwords(hosts[:1]))
+
+    def test_verified_connection_uses_custom_login(self):
+        from unittest.mock import Mock
+        client = Mock()
+        key = Mock()
+        client.get_host_keys.return_value = Mock()
+        with patch('paramiko.SSHClient',return_value=client), patch.object(core,'decode_key',return_value=key), patch.object(core,'run',side_effect=[(0,'pc-01'),(0,'1.8.4.1')]):
+            core.connect_verified(core.Host('pc-01','','208','dns','admin','host'),dict(ip='192.168.22.1',type='ssh-ed25519'),'own-secret')
+        self.assertEqual(client.connect.call_args.kwargs['username'],'admin')
+        self.assertEqual(client.connect.call_args.kwargs['password'],'own-secret')
+
+    def test_scoped_windows_credentials_are_isolated(self):
+        import ctypes
+        values = {}
+        buffers = []
+        def write(pointer, flags):
+            c = ctypes.cast(pointer,ctypes.POINTER(store.Credential)).contents
+            values[c.TargetName] = (c.UserName,ctypes.string_at(c.CredentialBlob,c.CredentialBlobSize))
+            return True
+        def read(target, kind, flags, output):
+            if target not in values: return False
+            login,blob = values[target]
+            b = (store.wintypes.BYTE*len(blob)).from_buffer_copy(blob)
+            c = store.Credential()
+            c.UserName=login
+            c.CredentialBlobSize=len(blob)
+            c.CredentialBlob=ctypes.cast(b,ctypes.POINTER(store.wintypes.BYTE))
+            buffers.append((b,c))
+            ctypes.cast(output,ctypes.POINTER(ctypes.POINTER(store.Credential)))[0]=ctypes.pointer(c)
+            return True
+        def delete(target,*args):
+            values.pop(target,None)
+            return True
+        backend=types.SimpleNamespace(write=write,read=read,delete=delete,free=lambda p:None,last_error=lambda:store.NOT_FOUND)
+        with patch.object(store,'os',types.SimpleNamespace(name='nt')),patch.object(store,'api',return_value=backend):
+            store.save('common')
+            store.save('one','admin','pc-01')
+            store.save('two','admin','pc-02')
+            self.assertEqual(store.load(),'common')
+            self.assertEqual(store.load('admin','pc-01'),'one')
+            self.assertIsNone(store.load('other','pc-01'))
+            store.delete('admin','pc-01')
+            self.assertIsNone(store.load('admin','pc-01'))
+            self.assertEqual(store.load('admin','pc-02'),'two')
+            self.assertEqual(store.load(),'common')
 
 
 if __name__ == '__main__':

@@ -153,7 +153,7 @@ class WorkbenchTests(unittest.TestCase):
     def test_all_inventory_password_and_power_actions_stay_available_in_menus(self):
         labels = {menu.entrycget(index, 'label'): (menu, index, inventory) for menu, index, inventory in self.app.menu_controls}
         expected = ['Добавить ПК…', 'Изменить выбранную строку…', 'Удалить отмеченные ПК…',
-                    'Перенести отмеченные в кабинет…', 'Открыть список .lst / .json…', 'Найти ПК по IP…',
+                    'Перенести отмеченные в кабинет…', 'Импорт списка .csv / .lst / .json…', 'Найти ПК по IP…',
                     'Добавить кабинет…', 'Удалить текущий кабинет…', 'Сохранить / изменить пароль…',
                     'Забыть сохранённый пароль', 'Выключить…', 'Перезагрузить…',
                     'Отменить запланированное выключение / перезагрузку…',
@@ -201,6 +201,54 @@ class WorkbenchTests(unittest.TestCase):
         app.apply_theme()
         self.assertEqual(dialogs[0].cget('background'), cm_ui.PALETTES['dark']['background'])
         dialogs[0].destroy()
+
+
+    def test_csv_merge_preview_cancel_and_preserve_fixed_address(self):
+        app = self.app
+        old = app.hosts[0]
+        from dataclasses import replace
+        app.hosts[0] = replace(old, mode='fixed', ip='192.168.22.100')
+        path = Path(self.temp.name) / 'computers.csv'
+        path.write_text('кабинет;компьютер;логин\nНовый;' + old.name + ';admin\n')
+        before = list(app.hosts)
+        with patch.object(gui.messagebox,'askokcancel',return_value=False):
+            app.import_csv(path)
+        self.assertEqual(app.hosts, before)
+        with patch.object(gui.messagebox,'askokcancel',return_value=True):
+            app.import_csv(path)
+        changed = next(h for h in app.hosts if h.name == old.name)
+        self.assertEqual((changed.room,changed.username,changed.credential_mode,changed.ip),('Новый','admin','host','192.168.22.100'))
+        self.assertEqual(len(app.hosts),len(before))
+
+    def test_editor_saves_scoped_password_and_preserves_other_host(self):
+        app = self.app
+        old = app.hosts[0]
+        def fill_and_save():
+            dialog = next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
+            frame = dialog.winfo_children()[0]
+            frame.grid_slaves(row=4,column=1)[0].delete(0,'end')
+            frame.grid_slaves(row=4,column=1)[0].insert(0,'admin')
+            field = frame.grid_slaves(row=5,column=1)[0]
+            self.assertEqual(field.cget('show'), '*')
+            field.insert(0,'private-test-value')
+            bar = frame.grid_slaves(row=10,column=0)[0]
+            next(w for w in bar.winfo_children() if w.cget('text')=='Сохранить').invoke()
+        before = app.hosts[1]
+        self.root.after(50,fill_and_save)
+        # A timeout keeps a broken editor from blocking the test process.
+        def close_dialog():
+            for w in self.root.winfo_children():
+                if isinstance(w,tk.Toplevel): w.destroy()
+        timer=self.root.after(2000,close_dialog)
+        with patch.object(gui.credential_store,'save') as save, patch.object(gui.messagebox,'showerror') as error:
+            app.host_editor(old)
+            error.assert_not_called()
+        self.root.after_cancel(timer)
+        save.assert_called_once_with('private-test-value','admin',old.name)
+        self.assertIn(before,app.hosts)
+        updated=next(h for h in app.hosts if h.name==old.name)
+        self.assertEqual((updated.username,updated.credential_mode),('admin','host'))
+        self.assertNotIn('private-test-value',app.inventory_file.read_text())
 
 
 if __name__ == '__main__':

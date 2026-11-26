@@ -17,7 +17,7 @@ DIST = ROOT / 'dist'
 DIST.mkdir(exist_ok=True)
 FILES = ['class_manager.py', 'cm_core.py', 'cm_ui.py', 'credential_store.py',
          'test_cm.py', 'test_cm_extended.py', 'test_cm_ui.py', 'README-RU.txt',
-         'requirements.txt', 'Start-CM.cmd', 'Start-CM.sh', 'Install-CM-Astra.sh',
+         'requirements.txt', 'computers-example.csv', 'Start-CM.cmd', 'Start-CM.sh', 'Install-CM-Astra.sh',
          'computers.json', 'key-catalog.json', 'legacy-lists/comp.lst', 'legacy-lists/comp2.lst']
 with tempfile.TemporaryDirectory(prefix='cm-build-', dir=DIST) as temporary:
     stage = Path(temporary) / 'CM-Astra'

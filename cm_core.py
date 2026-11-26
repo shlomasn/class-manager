@@ -3,6 +3,8 @@ import base64
 from dataclasses import dataclass, asdict
 import hashlib
 import ipaddress
+import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -73,6 +75,38 @@ class Host:
     ip: str
     room: str
     mode: str = 'dns'
+    username: str = 'user'
+    credential_mode: str = 'shared'
+
+
+def login_name(value):
+    value = value.strip()
+    if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_.-]{0,63}[$]?', value):
+        raise ValueError('Недопустимый логин SSH')
+    return value
+
+
+def load_csv(path):
+    raw = Path(path).read_bytes()
+    if len(raw) > 1024 * 1024:
+        raise ValueError('Слишком большой CSV')
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeError:
+        text = raw.decode('cp1251')
+    reader = csv.DictReader(io.StringIO(text), delimiter=';')
+    if reader.fieldnames != ['кабинет', 'компьютер', 'логин']:
+        raise ValueError('Заголовок CSV: кабинет;компьютер;логин. Паролей в CSV быть не должно.')
+    rows = []
+    for row in reader:
+        if None in row or any(value is None for value in row.values()):
+            raise ValueError('Неверное количество колонок CSV')
+        login = login_name(row['логин'] or 'user')
+        rows.append(dict(name=row['компьютер'], room=row['кабинет'], username=login,
+                         credential_mode='host', mode='dns'))
+    if not rows:
+        raise ValueError('CSV не содержит компьютеров')
+    return validate_hosts(rows)
 
 
 def hostname(value):
@@ -135,7 +169,11 @@ def validate_hosts(rows):
         if mode == 'fixed':
             fixed_ips.add(ip)
         default_room = name[1:4] if re.match(r'a\d{3}-', name) else 'Без класса'
-        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode))
+        login = login_name(row.get('username', 'user'))
+        credentials = row.get('credential_mode', 'shared' if login == 'user' else 'host')
+        if credentials not in ('shared', 'host') or (credentials == 'shared' and login != 'user'):
+            raise ValueError('Общий пароль доступен только для user')
+        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials))
     return result
 
 
@@ -316,7 +354,7 @@ def execute(host, pin, password, action, minutes, control=None):
         key = decode_key(pin)
         client.get_host_keys().add(ip, pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(ip, username='user', password=password, look_for_keys=False,
+        client.connect(ip, username=host.username, password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=6, auth_timeout=8)
         code, actual = run(client, '/bin/hostname -s', **options)
         if code != 0 or actual.strip().lower() != host.name:
@@ -336,7 +374,7 @@ def execute(host, pin, password, action, minutes, control=None):
         result.update(ok=True, message='Отмена отправлена' if action == 'cancel' else
                       ('Команда выключения' if action == 'off' else 'Команда перезагрузки') + (' принята; немедленно' if minutes == 0 else ' принята; через ' + str(minutes) + ' мин.'))
     except paramiko.AuthenticationException:
-        result.update(stop=True, message='Неверный пароль SSH или вход user запрещён; дальнейшие попытки остановлены')
+        result.update(stop=True, message='Неверный пароль SSH или вход выбранного пользователя запрещён; дальнейшие попытки остановлены')
     except paramiko.BadHostKeyException:
         result['message'] = 'SSH-ключ изменился; пароль не отправлен'
     except (paramiko.SSHException, EOFError, OSError) as error:
@@ -364,7 +402,7 @@ def connect_verified(host, pin, password, control=None):
         key = decode_key(pin)
         client.get_host_keys().add(ip, pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(ip, username='user', password=password, look_for_keys=False,
+        client.connect(ip, username=host.username, password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=6, auth_timeout=8)
         code, actual = run(client, '/bin/hostname -s', **options)
         if code != 0 or actual.strip().lower() != host.name:
@@ -399,7 +437,7 @@ def remote_path(value):
     if not isinstance(value, str) or not value or any(c in value for c in '\x00\r\n'):
         raise ValueError('Укажите папку на ученическом ПК: /полный/путь или ~/папка')
     if not (value.startswith('/') or value == '~' or value.startswith('~/')):
-        raise ValueError('Путь должен начинаться с / или ~/ (домашняя папка user)')
+        raise ValueError('Путь должен начинаться с / или ~/ (домашняя папка выбранного пользователя)')
     if '..' in value.split('/'):
         raise ValueError('Укажите путь без ..')
     return posixpath.normpath(value)
@@ -720,7 +758,7 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
         sftp.get_channel().settimeout(60)
         home = sftp.normalize('.')
         if not home.startswith('/') or home == '/':
-            raise RuntimeError('Не подтверждён домашний каталог user')
+            raise RuntimeError('Не подтверждён домашний каталог выбранного пользователя')
         destination = home if requested == '~' else (posixpath.join(home, requested[2:]) if requested.startswith('~/') else requested)
         result['destination'] = destination
         ensure_remote_directory(sftp, destination)
@@ -863,7 +901,7 @@ def probe_address(ip, control=None):
                 control.discard(transport)
 
 
-def inspect_address(pin, password, control=None):
+def inspect_address(pin, password, control=None, username='user'):
     """Get the actual hostname through pinned SSH; never trust PTR as identity."""
     if not password or "\n" in password or "\r" in password:
         raise ValueError("Некорректный пароль")
@@ -877,7 +915,7 @@ def inspect_address(pin, password, control=None):
         key = decode_key(pin)
         client.get_host_keys().add(pin['ip'], pin['type'], key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(pin['ip'], username='user', password=password, look_for_keys=False,
+        client.connect(pin['ip'], username=login_name(username), password=password, look_for_keys=False,
                        allow_agent=False, timeout=4, banner_timeout=5, auth_timeout=8)
         code, actual = run(client, '/bin/hostname -s', **options)
         name = hostname(actual.strip())

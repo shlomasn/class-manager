@@ -1,4 +1,5 @@
 """Per-Windows-user generic credential; no plaintext password files."""
+import hashlib
 import ctypes
 from ctypes import wintypes
 import os
@@ -9,6 +10,13 @@ from types import SimpleNamespace
 TARGET = 'CM-Astra/SSH/user'
 NOT_FOUND = 1168
 MAX_BLOB = 2560
+
+
+def target_name(username='user', host=None):
+    if host is None and username == 'user':
+        return TARGET  # Preserve the existing shared credential without migration.
+    identity = ((host or '') + '\0' + username).encode('utf-8')
+    return 'CM-Astra/SSH/host/' + hashlib.sha256(identity).hexdigest()
 
 
 class Credential(ctypes.Structure):
@@ -42,13 +50,13 @@ def validate(password):
         raise ValueError('Некорректный или слишком длинный пароль')
 
 
-def _windows_save(password):
+def _windows_save(password, username='user', host=None):
     validate(password)
     backend = api()
     blob = password.encode('utf-16-le')
     buffer = (wintypes.BYTE * len(blob)).from_buffer_copy(blob)
     credential = Credential()
-    credential.Type, credential.TargetName, credential.UserName = 1, TARGET, 'user'
+    credential.Type, credential.TargetName, credential.UserName = 1, target_name(username, host), username
     credential.CredentialBlobSize = len(blob)
     credential.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(wintypes.BYTE))
     credential.Persist = 2  # CRED_PERSIST_LOCAL_MACHINE: persists for this Windows user.
@@ -59,19 +67,19 @@ def _windows_save(password):
         ctypes.memset(buffer, 0, len(blob))
 
 
-def _windows_load():
+def _windows_load(username='user', host=None):
     if os.name != 'nt':
         return None
     backend = api()
     pointer = ctypes.POINTER(Credential)()
-    if not backend.read(TARGET, 1, 0, ctypes.byref(pointer)):
+    if not backend.read(target_name(username, host), 1, 0, ctypes.byref(pointer)):
         if backend.last_error() == NOT_FOUND:
             return None
         raise RuntimeError('Не удалось прочитать пароль Windows; код ' + str(backend.last_error()))
     try:
         credential = pointer.contents
         size = credential.CredentialBlobSize
-        if credential.UserName != 'user' or not 0 < size <= MAX_BLOB or size % 2 or not credential.CredentialBlob:
+        if credential.UserName != username or not 0 < size <= MAX_BLOB or size % 2 or not credential.CredentialBlob:
             raise ValueError('Неверный формат')
         password = ctypes.string_at(credential.CredentialBlob, size).decode('utf-16-le')
         validate(password)
@@ -82,13 +90,13 @@ def _windows_load():
         backend.free(pointer)
 
 
-def _windows_delete():
+def _windows_delete(username='user', host=None):
     backend = api()
-    if not backend.delete(TARGET, 1, 0) and backend.last_error() != NOT_FOUND:
+    if not backend.delete(target_name(username, host), 1, 0) and backend.last_error() != NOT_FOUND:
         raise RuntimeError('Не удалось удалить пароль Windows; код ' + str(backend.last_error()))
 
 
-def _secret(action, password=None):
+def _secret(action, password=None, username='user', host=None):
     tool = shutil.which('secret-tool')
     if not tool:
         if action == 'lookup':
@@ -96,8 +104,10 @@ def _secret(action, password=None):
         raise RuntimeError('Для сохранения на Astra установите libsecret-tools и gnome-keyring; запустите CM в графическом сеансе')
     command = [tool, action]
     if action == 'store':
-        command += ['--label=CM Astra: локальный user']
-    command += ['application', 'CM-Astra', 'account', 'user']
+        command += ['--label=CM Astra: ' + username + (' @ ' + host if host else '')]
+    command += ['application', 'CM-Astra', 'account', username]
+    if host is not None:
+        command += ['host', host]
     try:
         result = subprocess.run(command, input=password if password is not None else None,
                                 capture_output=True, text=True, encoding='utf-8', timeout=60)
@@ -110,25 +120,25 @@ def _secret(action, password=None):
     return result.stdout if action == 'lookup' else None
 
 
-def save(password):
+def save(password, username='user', host=None):
     validate(password)
     if os.name == 'nt':
-        _windows_save(password)
+        _windows_save(password, username, host)
     else:
-        _secret('store', password)
+        _secret('store', password, username, host)
 
 
-def load():
+def load(username='user', host=None):
     if os.name == 'nt':
-        return _windows_load()
-    password = _secret('lookup')
+        return _windows_load(username, host)
+    password = _secret('lookup', username=username, host=host)
     if password is not None:
         validate(password)
     return password
 
 
-def delete():
+def delete(username='user', host=None):
     if os.name == 'nt':
-        _windows_delete()
+        _windows_delete(username, host)
     else:
-        _secret('clear')
+        _secret('clear', username=username, host=host)
