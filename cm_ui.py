@@ -1,5 +1,7 @@
 """Shared Tk presentation for Windows and Astra. No network or inventory writes."""
 from collections import Counter
+import ipaddress
+import re
 from tkinter import font, ttk
 
 PALETTES = {
@@ -166,3 +168,27 @@ def sync_rows(tree, rows):
             tree.move(identifier, '', index)
         else:
             tree.insert('', index, iid=identifier, values=values, tags=tags)
+
+
+def sorted_computer_rows(rows, column, reverse=False):
+    """Sort displayed values only; stable host IDs keep selection and operation ownership."""
+    if column is None:
+        return rows
+    index = ('check', 'name', 'ip', 'status', 'stop').index(column)
+
+    def natural(value):
+        return tuple((1, int(part)) if part.isdigit() else (0, part.casefold())
+                     for part in re.split(r'(\d+)', str(value)))
+
+    def key(row):
+        value = row[1][index]
+        if column == 'ip':
+            try:
+                primary = (0, int(ipaddress.IPv4Address(value)))
+            except ipaddress.AddressValueError:
+                primary = (1, natural(value))
+        else:
+            primary = natural(value)
+        return primary, natural(row[0])
+
+    return sorted(rows, key=key, reverse=reverse)

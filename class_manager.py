@@ -111,11 +111,13 @@ class Manager:
         self.last_results = []
         self.last_ips = {}
         self.selected = set()
+        self.sort_column = None
+        self.sort_reverse = False
         self.statuses = {}
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.6 — управление школьными компьютерами')
+        window.title('CM Astra 2.7 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -140,7 +142,7 @@ class Manager:
         self.menu_controls = []
         self.window.grid_rowconfigure(0, weight=1)
         self.window.grid_columnconfigure(1, weight=1)
-        sidebar = ttk.Frame(self.window, style='Surface.TFrame', padding=(14, 20), width=184)
+        sidebar = self.sidebar = ttk.Frame(self.window, style='Surface.TFrame', padding=(14, 20), width=184)
         sidebar.grid(row=0, column=0, sticky='nsew')
         sidebar.grid_propagate(False)
         sidebar.grid_columnconfigure(0, weight=1)
@@ -161,11 +163,12 @@ class Manager:
         self.room_list.configure(yscrollcommand=room_scroll.set)
         self.room_list.bind('<<TreeviewSelect>>', self.room_selected)
 
-        settings = ttk.Menubutton(sidebar, text='Управление и настройки')
+        settings = self.settings_button = ttk.Menubutton(sidebar, text='Управление и\nнастройки')
         settings.grid(row=3, column=0, sticky='ew', pady=(15, 10))
         self.controls.append(settings)
         menu = tk.Menu(settings, tearoff=False)
         settings.configure(menu=menu)
+        sidebar.bind('<Configure>', self.fit_sidebar, add='+')
         computers = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Компьютеры', menu=computers)
         for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
@@ -189,7 +192,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.6 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.7 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -250,10 +253,12 @@ class Manager:
         table_frame.grid_rowconfigure(0, weight=1)
         columns = ('check', 'name', 'ip', 'status', 'stop')
         self.table = ttk.Treeview(table_frame, columns=columns, show='headings', selectmode='browse', height=8)
+        self.column_titles = {}
         for name, title, width, minimum in [('check', 'Выбор', 52, 48), ('name', 'Компьютер', 135, 112),
                                             ('ip', 'IP-адрес', 133, 115), ('status', 'Состояние / результат', 370, 155),
                                             ('stop', 'Действие', 90, 85)]:
-            self.table.heading(name, text=title)
+            self.column_titles[name] = title
+            self.table.heading(name, text=title, command=lambda column=name: self.sort_table(column))
             self.table.column(name, width=width, minwidth=minimum, stretch=name == 'status')
         self.table.tag_configure('chosen', background=self.palette['tint'])
         self.table.tag_configure('error', foreground=self.palette['error'])
@@ -426,9 +431,24 @@ class Manager:
             stop = 'Остановить' if operation.get('action') in ('distribute', 'command', 'wake') else ''
             rows.append((host.name, ('☑' if chosen else '☐', host.name,
                          self.last_ips.get(host.name, 'Авто (DNS)' if host.mode == 'dns' else host.ip), status, stop), tags))
-        cm_ui.sync_rows(self.table, rows)
+        cm_ui.sync_rows(self.table, cm_ui.sorted_computer_rows(rows, self.sort_column, self.sort_reverse))
         self.counter.set('Выбрано: ' + str(len(self.selected)))
         self.refresh_dashboard()
+
+    def fit_sidebar(self, event=None):
+        # Include theme padding and the menu arrow in the measured request, also at high DPI.
+        width = max(184, self.settings_button.winfo_reqwidth() + 28)
+        if self.sidebar.cget('width') != width:
+            self.sidebar.configure(width=width)
+        self.window.minsize(850 + width - 184, 600)
+
+    def sort_table(self, column):
+        self.sort_reverse = not self.sort_reverse if self.sort_column == column else False
+        self.sort_column = column
+        for name, title in self.column_titles.items():
+            arrow = (' ▼' if self.sort_reverse else ' ▲') if name == column else ''
+            self.table.heading(name, text=title + arrow)
+        self.refresh()
 
     def change_room(self):
         # A hidden selection must never shut down computers from another classroom.
@@ -1752,6 +1772,8 @@ class Manager:
             self.statuses[name] = (label, False)
             if self.table.exists(name):
                 self.table.set(name, 'status', label)
+                if self.sort_column == 'status':
+                    self.refresh()
             self.summary.set(name + ': ' + label)
         elif kind == 'distribution_started':
             states = {name: dict(percent=0, complete=False) for name in value}
@@ -1774,6 +1796,8 @@ class Manager:
                 self.statuses[name] = (label, False)
                 if self.table.exists(name):
                     self.table.set(name, 'status', label)
+                    if self.sort_column == 'status':
+                        self.refresh()
                 show_progress()
         elif kind == 'local_networks':
             self.choose_local_network(value)

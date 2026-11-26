@@ -534,6 +534,7 @@ class DispatchTests(unittest.TestCase):
         import queue
         app = gui.Manager.__new__(gui.Manager)
         app.events = queue.Queue()
+        app.sort_column, app.sort_reverse = None, False
         app.statuses = {}
         app.distribution_state = {name: dict(percent=0, complete=False) for name in ['a209-01', 'a209-02']}
         displayed = {}
@@ -555,6 +556,7 @@ class DispatchTests(unittest.TestCase):
     def test_command_status_shows_live_line_and_elapsed_time_until_result(self):
         import queue
         app = gui.Manager.__new__(gui.Manager)
+        app.sort_column, app.sort_reverse = None, False
         app.events, app.statuses = queue.Queue(), {}
         displayed = {}
         app.table = types.SimpleNamespace(exists=lambda name: True, set=lambda name, column, value: displayed.update({name: value}))
@@ -584,6 +586,7 @@ class ConcurrentOperationsTests(unittest.TestCase):
         app.busy, app.closing, app.preparing_operation = False, False, None
         app.events = __import__('queue').Queue()
         app.job, app.last_results = {}, []
+        app.sort_column, app.sort_reverse = None, False
         app.statuses, app.trusted, app.catalog, app.last_ips = {}, {}, {}, {}
         app.selected = set()
         app.last_upload_directory = None

@@ -52,6 +52,77 @@ class WorkbenchTests(unittest.TestCase):
                         if widget in app.controls:
                             self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth() - 2, widget.cget('text'))
 
+    def test_header_sort_is_natural_and_survives_progress_refresh(self):
+        from dataclasses import replace
+        app = self.app
+        template = app.hosts[0]
+        app.hosts = [replace(template, name=name, mode='fixed', ip=ip)
+                     for name, ip in [('pc10', '192.168.1.10'), ('pc2', '192.168.1.2'), ('pc1', '192.168.1.100')]]
+        app.selected = {'pc10'}
+        app.refresh()
+        app.table.focus('pc10')
+        app.table.selection_set('pc10')
+        self.root.tk.call(app.table.heading('name', 'command'))
+        self.assertEqual(app.table.get_children(), ('pc1', 'pc2', 'pc10'))
+        app.sort_table('name')
+        self.assertEqual(app.table.get_children(), ('pc10', 'pc2', 'pc1'))
+        self.assertIn('▼', app.table.heading('name', 'text'))
+        app.sort_table('ip')
+        self.assertEqual(app.table.get_children(), ('pc2', 'pc10', 'pc1'))
+        op = app.operations.start('command', app.hosts[:1], {})
+        op['state'] = 'running'
+        app.handle_event('command_progress', dict(name='pc10', phase='Выполняется', elapsed=4, output='hello'), op['id'])
+        app.refresh()
+        self.assertEqual(app.table.get_children(), ('pc2', 'pc10', 'pc1'))
+        self.assertEqual(app.selected, {'pc10'})
+        self.assertEqual(app.table.focus(), 'pc10')
+        self.assertEqual(app.table.selection(), ('pc10',))
+        self.assertIn('hello', app.table.set('pc10', 'status'))
+        self.assertEqual(app.operations.owners['pc10'], op['id'])
+        app.sort_table('ip')
+        self.assertEqual(app.table.get_children(), ('pc1', 'pc10', 'pc2'))
+        app.theme.set('dark')
+        app.apply_theme()
+        app.refresh()
+        self.assertEqual(app.table.get_children(), ('pc1', 'pc10', 'pc2'))
+
+    def test_sort_handles_dns_empty_and_status_updates(self):
+        app = self.app
+        first, second = app.hosts[:2]
+        app.last_ips[first.name] = '192.168.1.2'
+        app.last_ips[second.name] = ''
+        app.sort_table('ip')
+        self.assertEqual(app.table.get_children()[0], first.name)
+        app.sort_table('status')
+        op = app.operations.start('command', [first], {})
+        app.handle_event('command_progress', dict(name=first.name, phase='А', elapsed=1, output=''), op['id'])
+        self.assertEqual(app.table.get_children()[0], first.name)
+        app.handle_event('command_progress', dict(name=first.name, phase='Я', elapsed=2, output=''), op['id'])
+        self.assertEqual(app.table.get_children()[-1], first.name)
+        app.room.set(first.room)
+        app.change_room()
+        self.assertEqual(app.sort_column, 'status')
+        self.assertIn(first.name, app.table.get_children())
+
+    def test_settings_label_fits_both_themes_and_larger_fonts(self):
+        app = self.app
+        style = ttk.Style(self.root)
+        for theme in ('light', 'dark'):
+            app.theme.set(theme)
+            app.apply_theme()
+            for size in (10, 15, 20):
+                style.configure('TMenubutton', font=('Arial', size))
+                self.root.update_idletasks()
+                app.fit_sidebar()
+                self.root.update_idletasks()
+                minimum = self.root.minsize()
+                self.root.geometry('%dx%d' % minimum)
+                self.root.update_idletasks()
+                self.assertEqual(app.settings_button.cget('text').replace('\n', ' '), 'Управление и настройки')
+                self.assertGreaterEqual(app.settings_button.winfo_width(), app.settings_button.winfo_reqwidth())
+                self.assertGreaterEqual(app.settings_button.winfo_height(), app.settings_button.winfo_reqheight())
+                self.assertGreater(app.room_list.winfo_height(), 30)
+
     def test_long_room_name_keeps_action_buttons_visible(self):
         app = self.app
         name = 'Ш' * 40
