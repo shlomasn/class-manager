@@ -1541,5 +1541,75 @@ class UniversalNetworkTests(unittest.TestCase):
             self.assertEqual(core.load_hosts(path)[0].domain,'')
 
 
+
+class AutomaticNetworkTests(unittest.TestCase):
+    def test_windows_interface_json_excludes_public_and_duplicates(self):
+        rows = core.local_network_rows([
+            dict(InterfaceAlias='Wi-Fi',IPAddress='192.168.7.15',PrefixLength=24),
+            dict(InterfaceAlias='Wi-Fi',IPAddress='192.168.7.15',PrefixLength=24),
+            dict(InterfaceAlias='VPN',IPAddress='10.2.3.4',PrefixLength=16),
+            dict(InterfaceAlias='Loopback',IPAddress='127.0.0.1',PrefixLength=8),
+            dict(InterfaceAlias='Public',IPAddress='8.8.8.8',PrefixLength=24),
+            dict(InterfaceAlias='No mask',IPAddress='192.168.7.15')], 'windows')
+        self.assertEqual(len(rows),2)
+        self.assertEqual({r['network'] for r in rows},{'192.168.7.0/24','10.2.0.0/16'})
+        self.assertEqual(core.local_network_rows(dict(InterfaceAlias='LAN',IPAddress='10.0.0.1',PrefixLength=8),'windows')[0]['network'],'10.0.0.0/8')
+
+    def test_linux_interface_flags_and_actual_netmasks(self):
+        def row(name,flags,ip,mask,state='UP'):
+            return dict(ifname=name,flags=flags,operstate=state,addr_info=[dict(family='inet',local=ip,prefixlen=mask)])
+        payload=[row('enp1s0',['UP'],'172.20.4.8',23),row('lo',['UP','LOOPBACK'],'127.0.0.1',8),
+                 row('wlan0',[],'192.168.2.4',24),row('down',['UP'],'10.1.1.1',24,'DOWN'),row('bad',['UP'],'10.1.1.1',2)]
+        self.assertEqual(core.local_network_rows(payload,'linux'),[dict(interface='enp1s0',ip='172.20.4.8',network='172.20.4.0/23')])
+
+    def test_large_subnet_part_defaults_to_teacher_block_without_silent_full_scan(self):
+        row=dict(interface='LAN',ip='10.30.42.11',network='10.30.0.0/16')
+        plan=core.automatic_scan_plan(row)
+        self.assertEqual((plan['network'],plan['part'],plan['parts'],plan['partial']),('10.30.42.0/24',43,256,True))
+        self.assertEqual(len(plan['addresses']),253)
+        self.assertNotIn(row['ip'],plan['addresses'])
+        self.assertEqual(core.automatic_scan_plan(row,1)['network'],'10.30.0.0/24')
+        self.assertEqual(core.automatic_scan_plan(row,256)['network'],'10.30.255.0/24')
+        for part in (0,257,'1'):
+            with self.assertRaises(ValueError): core.automatic_scan_plan(row,part)
+
+    def test_small_subnet_scans_whole_network_and_excludes_all_teacher_addresses(self):
+        row=dict(interface='LAN',ip='192.168.4.5',network='192.168.4.0/23')
+        plan=core.automatic_scan_plan(row,exclude=['192.168.4.6'])
+        self.assertFalse(plan['partial'])
+        self.assertEqual(len(plan['addresses']),508)
+        self.assertNotIn('192.168.4.6',plan['addresses'])
+        plan=core.automatic_scan_plan(dict(interface='LAN',ip='10.1.1.1',network='10.1.1.1/32'))
+        self.assertEqual(plan['addresses'],[])
+
+    def test_windows_detection_uses_connected_interfaces_without_shell_or_passwords(self):
+        import subprocess,shutil
+        output=json.dumps([dict(InterfaceAlias='LAN',IPAddress='10.1.1.5',PrefixLength=24)]).encode()
+        with patch.object(core.os,'name','nt'),patch.object(shutil,'which',return_value='powershell.exe'),patch.object(subprocess,'CREATE_NO_WINDOW',0,create=True),patch.object(subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout=output)) as run:
+            rows=core.detect_local_networks()
+        self.assertEqual(rows[0]['network'],'10.1.1.0/24')
+        command=run.call_args.args[0]
+        self.assertIn('-NonInteractive',command)
+        self.assertIn('-ConnectionState Connected',command[-1])
+        self.assertNotIn('shell',run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs['timeout'],15)
+
+    def test_linux_detection_runs_only_read_only_ip_command(self):
+        import subprocess,shutil,sys
+        output=b'[{"ifname":"eth0","flags":["UP"],"addr_info":[{"family":"inet","local":"192.168.1.5","prefixlen":24}]}]'
+        with patch.object(core.os,'name','posix'),patch.object(sys,'platform','linux'),patch.object(shutil,'which',return_value='/usr/sbin/ip'),patch.object(subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout=output)) as run:
+            rows=core.detect_local_networks()
+        self.assertEqual(rows[0]['network'],'192.168.1.0/24')
+        self.assertEqual(run.call_args.args[0],['/usr/sbin/ip','-j','-4','address','show','up'])
+
+    def test_detection_timeout_and_invalid_json_never_guess_a_subnet(self):
+        import subprocess,shutil,sys
+        with patch.object(core.os,'name','posix'),patch.object(sys,'platform','linux'),patch.object(shutil,'which',return_value='/usr/sbin/ip'):
+            for outcome in (subprocess.TimeoutExpired('ip',15),types.SimpleNamespace(returncode=0,stdout=b'invalid')):
+                with patch.object(subprocess,'run',side_effect=outcome if isinstance(outcome,Exception) else None,return_value=outcome):
+                    with self.assertRaisesRegex(RuntimeError,'ручной диапазон'):
+                        core.detect_local_networks()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -893,6 +893,83 @@ def parse_addresses(text, limit=512):
     return sorted(addresses, key=lambda value: int(ipaddress.IPv4Address(value)))
 
 
+def local_network_rows(payload, platform):
+    """Normalize OS interface addresses; never infer a netmask from an IP."""
+    candidates = []
+    if platform == 'windows':
+        for row in payload if isinstance(payload, list) else [payload]:
+            if row:
+                candidates.append((row.get('InterfaceAlias', ''), row.get('IPAddress', ''), row.get('PrefixLength')))
+    else:
+        for row in payload:
+            if 'UP' not in row.get('flags', []) or 'LOOPBACK' in row.get('flags', []) or row.get('operstate') == 'DOWN':
+                continue
+            for address in row.get('addr_info', []):
+                if address.get('family') == 'inet':
+                    candidates.append((row.get('ifname', ''), address.get('local', ''), address.get('prefixlen')))
+    result, seen = [], set()
+    for interface, address, prefix in candidates:
+        try:
+            ip = school_ip(address)
+            if type(prefix) is not int or not 0 <= prefix <= 32:
+                continue
+            network = ipaddress.IPv4Network(ip + '/' + str(prefix), strict=False)
+            if not any(network.subnet_of(ipaddress.ip_network(private)) for private in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')):
+                continue
+            key = (interface, ip, str(network))
+            if key not in seen:
+                seen.add(key)
+                result.append(dict(interface=str(interface), ip=ip, network=str(network)))
+        except (ValueError, TypeError):
+            continue
+    return sorted(result, key=lambda row: (row['interface'], int(ipaddress.IPv4Address(row['ip']))))
+
+
+def detect_local_networks():
+    """Read connected IPv4 interfaces without admin privileges or network probes."""
+    import shutil
+    import subprocess
+    import sys
+    if os.name == 'nt':
+        tool = shutil.which('powershell.exe')
+        if not tool:
+            raise RuntimeError('Windows PowerShell недоступен. Используйте ручной диапазон IP.')
+        script = ("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+                  "@(Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected | "
+                  "ForEach-Object { Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue } | "
+                  "Select-Object InterfaceAlias,IPAddress,PrefixLength) | ConvertTo-Json -Compress")
+        command, platform = [tool, '-NoProfile', '-NonInteractive', '-Command', script], 'windows'
+    elif sys.platform.startswith('linux'):
+        tool = shutil.which('ip') or next((str(p) for p in (Path('/usr/sbin/ip'),Path('/sbin/ip')) if p.exists()), None)
+        if not tool:
+            raise RuntimeError('Не найдена команда ip (пакет iproute2). Используйте ручной диапазон IP.')
+        command, platform = [tool, '-j', '-4', 'address', 'show', 'up'], 'linux'
+    else:
+        raise RuntimeError('Автоопределение сети поддерживается на Windows и Linux/Astra. Используйте ручной диапазон IP.')
+    try:
+        options = dict(creationflags=subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else {}
+        completed = subprocess.run(command, capture_output=True, timeout=15, **options)
+        if completed.returncode or len(completed.stdout) > 1024 * 1024:
+            raise ValueError('Не получены настройки интерфейсов')
+        text = completed.stdout.decode('utf-8-sig')
+        return local_network_rows(json.loads(text) if text.strip() else [], platform)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise RuntimeError('Не удалось прочитать локальные сети. Используйте ручной диапазон IP.') from None
+
+
+def automatic_scan_plan(row, part=None, exclude=()):
+    network = ipaddress.IPv4Network(row['network'])
+    # A large real subnet is explicitly divided into /24 blocks, never silently scanned in full.
+    parts = 2 ** (24 - network.prefixlen) if network.prefixlen < 23 else 1
+    default = (int(ipaddress.IPv4Address(row['ip'])) - int(network.network_address)) // 256 + 1 if parts > 1 else 1
+    part = default if part is None else part
+    if type(part) is not int or not 1 <= part <= parts:
+        raise ValueError('Выберите допустимый номер части сети')
+    selected = ipaddress.IPv4Network((int(network.network_address) + (part - 1) * 256, 24)) if parts > 1 else network
+    addresses = [ip for ip in parse_addresses(str(selected)) if ip not in set(exclude) | {row['ip']}]
+    return dict(network=str(selected), addresses=addresses, parts=parts, part=part, partial=parts > 1)
+
+
 def probe_address(ip, control=None):
     # No authentication or mutation during the first scan phase.
     import paramiko

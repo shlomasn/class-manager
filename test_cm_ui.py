@@ -282,5 +282,39 @@ class WorkbenchTests(unittest.TestCase):
         window.destroy()
 
 
+    def test_auto_network_dialog_cancel_does_not_scan(self):
+        app=self.app
+        rows=[dict(interface='LAN',ip='192.168.2.10',network='192.168.2.0/24')]
+        def cancel():
+            dialog=next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
+            def widgets(parent):
+                for w in parent.winfo_children():
+                    yield w
+                    yield from widgets(w)
+            next(w for w in widgets(dialog) if isinstance(w,ttk.Button) and w.cget('text')=='Отмена').invoke()
+        self.root.after(50,cancel)
+        with patch.object(app,'start_scan') as start:
+            app.choose_local_network(rows)
+        start.assert_not_called()
+
+    def test_auto_network_dialog_selects_detected_scope_without_manual_input(self):
+        app=self.app
+        rows=[dict(interface='Wi-Fi',ip='10.20.30.10',network='10.20.0.0/16')]
+        def start():
+            dialog=next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
+            def widgets(parent):
+                for w in parent.winfo_children():
+                    yield w
+                    yield from widgets(w)
+            next(w for w in widgets(dialog) if isinstance(w,ttk.Button) and w.cget('text')=='Найти компьютеры').invoke()
+        self.root.after(50,start)
+        with patch.object(app,'start_scan') as scan:
+            app.choose_local_network(rows)
+        ips=scan.call_args.args[0]
+        self.assertEqual(len(ips),253)
+        self.assertEqual(ips[0],'10.20.30.1')
+        self.assertNotIn('10.20.30.10',ips)
+
+
 if __name__ == '__main__':
     unittest.main()

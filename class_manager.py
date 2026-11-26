@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan
 import credential_store
 import cm_ui
 
@@ -115,7 +115,7 @@ class Manager:
         self.busy = False
         self.events = queue.Queue()
         self.controls = []
-        window.title('CM Astra 2.3 — управление школьными компьютерами')
+        window.title('CM Astra 2.4 — управление школьными компьютерами')
         window.geometry(str(min(1220, window.winfo_screenwidth() - 60)) + 'x' + str(min(800, window.winfo_screenheight() - 90)))
         window.minsize(850, 600)
         window.protocol('WM_DELETE_WINDOW', self.close)
@@ -170,7 +170,7 @@ class Manager:
         menu.add_cascade(label='Компьютеры', menu=computers)
         for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
                               ('Удалить отмеченные ПК…', self.remove_hosts), ('Перенести отмеченные в кабинет…', self.move_hosts),
-                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Найти ПК по IP…', self.scan_range)]:
+                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Найти ПК в моей сети…', self.scan_local_network), ('Найти ПК по IP…', self.scan_range)]:
             self.menu_action(computers, text, command, inventory=True)
         rooms = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Кабинеты', menu=rooms)
@@ -189,7 +189,7 @@ class Manager:
         ttk.Label(appearance, text='ОФОРМЛЕНИЕ', style='Side.TLabel').pack(anchor='w', pady=(0, 4))
         for text, value in [('Светлая', 'light'), ('Тёмная', 'dark')]:
             ttk.Radiobutton(appearance, text=text, value=value, variable=self.theme, command=self.apply_theme).pack(anchor='w')
-        ttk.Label(sidebar, text='CM 2.3 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
+        ttk.Label(sidebar, text='CM 2.4 · Windows / Astra', style='Side.TLabel').grid(row=6, column=0, sticky='w', pady=(14, 0))
 
         main = ttk.Frame(self.window, padding=(22, 18))
         main.grid(row=0, column=1, sticky='nsew')
@@ -967,6 +967,81 @@ class Manager:
             text.configure(state='disabled')
         cm_ui.color_widgets(dialog, self.palette)
 
+    def scan_local_network(self):
+        self.set_busy(True)
+        self.summary.set('Определение локальных IPv4-сетей компьютера учителя…')
+        threading.Thread(target=self.detect_network_worker, daemon=True).start()
+
+    def detect_network_worker(self):
+        try:
+            self.events.put(('local_networks', detect_local_networks()))
+        except Exception as error:
+            self.events.put(('error', str(error)))
+
+    def choose_local_network(self, rows):
+        self.set_busy(False)
+        if not rows:
+            messagebox.showinfo('Локальные сети', 'Активных локальных IPv4-сетей не найдено. Проверьте подключение или используйте ручной диапазон IP.', parent=self.window)
+            return
+        dialog = tk.Toplevel(self.window)
+        dialog.title('Найти ПК в моей сети')
+        dialog.transient(self.window)
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='Выберите школьное подключение. VPN и виртуальные интерфейсы тоже могут быть в списке.').pack(anchor='w')
+        labels = [row['interface'] + ' · IP ' + row['ip'] + ' · сеть ' + row['network'] for row in rows]
+        choice = ttk.Combobox(frame, values=labels, state='readonly', width=85)
+        choice.pack(fill='x', pady=10)
+        choice.current(0)
+        info = tk.StringVar()
+        ttk.Label(frame, textvariable=info, wraplength=640).pack(anchor='w', pady=6)
+        part = tk.StringVar()
+        part_row = ttk.Frame(frame)
+        part_row.pack(fill='x', pady=6)
+        ttk.Label(part_row, text='Часть большой сети:').pack(side='left')
+        number = ttk.Spinbox(part_row, from_=1, to=1, textvariable=part, width=8)
+        number.pack(side='left', padx=8)
+        preview = tk.StringVar()
+        ttk.Label(frame, textvariable=preview, wraplength=640).pack(anchor='w', pady=8)
+        own_ips = {row['ip'] for row in rows}
+        def show_plan(*args):
+            try:
+                plan = automatic_scan_plan(rows[choice.current()], int(part.get()), own_ips)
+                preview.set('Будет проверено: ' + plan['network'] + ', адресов: ' + str(len(plan['addresses'])) + '. Компьютер учителя исключён.')
+            except (ValueError, IndexError):
+                preview.set('Выберите допустимый номер части сети.')
+        def selected(event=None):
+            plan = automatic_scan_plan(rows[choice.current()], exclude=own_ips)
+            number.configure(to=plan['parts'], state='normal' if plan['partial'] else 'disabled')
+            info.set('Подсеть большая: будет проверена только выбранная часть /24. По умолчанию — часть с компьютером учителя. Для остальных частей меняйте номер и повторяйте поиск.' if plan['partial'] else 'Будет проверена вся выбранная подсеть (до 512 адресов).')
+            part.set(str(plan['part']))
+        part.trace_add('write', show_plan)
+        choice.bind('<<ComboboxSelected>>', selected)
+        selected()
+        ttk.Label(frame, text='Поиск обнаруживает доступные SSH-серверы. Затем проверяются имя и Astra;\nвы сами выбираете, какие ПК добавить. Без SSH компьютер не появится в результатах.').pack(anchor='w', pady=8)
+        bar = ttk.Frame(frame)
+        bar.pack(fill='x', pady=8)
+        def search():
+            try:
+                plan = automatic_scan_plan(rows[choice.current()], int(part.get()), own_ips)
+                if not plan['addresses']:
+                    raise ValueError('В этой сети нет других адресов для поиска')
+            except (ValueError, IndexError) as error:
+                messagebox.showerror('Локальная сеть', str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self.start_scan(plan['addresses'])
+        ttk.Button(bar, text='Найти компьютеры', command=search).pack(side='left')
+        ttk.Button(bar, text='Отмена', command=dialog.destroy).pack(side='right')
+        cm_ui.color_widgets(dialog, self.palette)
+        dialog.grab_set()
+        self.window.wait_window(dialog)
+
+    def start_scan(self, addresses):
+        self.set_busy(True)
+        self.summary.set('Поиск SSH-серверов: ' + str(len(addresses)) + ' адресов; без команд и паролей…')
+        threading.Thread(target=self.scan_worker, args=(addresses,), daemon=True).start()
+
     def scan_range(self):
         value = simpledialog.askstring('Найти компьютеры', 'IP, диапазон, подсеть или список через запятую. До 512 адресов.\nПример: 192.168.22.1-192.168.22.32, 192.168.201.39', parent=self.window)
         if value is None:
@@ -976,16 +1051,20 @@ class Manager:
         except Exception as error:
             messagebox.showerror('Диапазон IP', str(error), parent=self.window)
             return
-        self.set_busy(True)
-        self.summary.set('Поиск SSH-серверов: ' + str(len(addresses)) + ' адресов; без команд и паролей…')
-        threading.Thread(target=self.scan_worker, args=(addresses,), daemon=True).start()
+        self.start_scan(addresses)
 
     def scan_worker(self, addresses):
         try:
             with ThreadPoolExecutor(max_workers=16) as pool:
                 control = getattr(self, 'shutdown', None)
                 options = dict(control=control) if control else {}
-                rows = list(pool.map(lambda ip: probe_address(ip, **options), addresses))
+                pending = [pool.submit(probe_address, ip, **options) for ip in addresses]
+                rows = []
+                for future in as_completed(pending):
+                    if control:
+                        control.check()
+                    rows.append(future.result())
+                    self.events.put(('scan_progress', 'Поиск SSH: проверено ' + str(len(rows)) + ' из ' + str(len(addresses))))
             self.events.put(('range_found', [row for row in rows if row['ok']]))
         except Exception as error:
             self.events.put(('error', str(error)))
@@ -1593,6 +1672,8 @@ class Manager:
                 if self.table.exists(name):
                     self.table.set(name, 'status', label)
                 show_progress()
+        elif kind == 'local_networks':
+            self.choose_local_network(value)
         elif kind == 'range_found':
             self.range_found(value)
         elif kind == 'range_inspected':
