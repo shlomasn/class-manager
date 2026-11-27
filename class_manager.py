@@ -189,7 +189,7 @@ class Manager:
         menu.add_cascade(label='Данные школы', menu=profile)
         self.menu_action(profile, 'Сохранить копию…', self.export_profile, inventory=True)
         self.menu_action(profile, 'Восстановить из копии…', self.restore_profile, inventory=True)
-        self.menu_action(menu, 'Настройки сети…', self.network_settings, inventory=True)
+        self.menu_action(menu, 'Домен для имён ПК…', self.network_settings, inventory=True)
         self.menu_action(menu, 'Сохранить / изменить пароль…', self.save_password)
         self.menu_action(menu, 'Забыть сохранённый пароль', self.forget_password)
         menu.add_separator()
@@ -595,11 +595,15 @@ class Manager:
         self.summary.set('CSV импортирован. Пароли задаются в карточках ПК или при подключении.')
 
     def network_settings(self):
-        value = simpledialog.askstring('Настройки сети',
-            'Домен школы (необязательно). Пусто — использовать введённое имя.\n'
-            'DNS-сервер берётся из настроек ОС учителя.\n'
-            'Если имя не находится, задайте IP или используйте поиск по диапазону.\n'
-            'Изменение применяется к домену всех ПК, SSH-ключи сохраняются:',
+        value = simpledialog.askstring('Домен для имён ПК',
+            'Если администратор школы дал вам домен, укажите его здесь.\n'
+            'Например, с доменом school.example CM будет искать ПК pc-01\n'
+            'по полному имени pc-01.school.example.\n\n'
+            'Если домена нет или короткие имена уже работают,\n'
+            'оставьте поле пустым. Постоянные IP и полные имена\n'
+            'используются как указаны в карточках ПК.\n\n'
+            'Изменение применяется и к уже добавленным ПК.\n'
+            'Настройки сети Windows или Astra не меняются.',
             initialvalue=self.domain, parent=self.window)
         if value is None:
             return
@@ -613,7 +617,7 @@ class Manager:
             self.statuses.clear()
             self.refresh()
         except Exception as error:
-            messagebox.showerror('Настройки сети', str(error), parent=self.window)
+            messagebox.showerror('Домен для имён ПК', str(error), parent=self.window)
 
     def persist(self):
         save_inventory(self.inventory_file, self.rooms, self.hosts, domain=self.domain)
