@@ -17,7 +17,7 @@ DIST = ROOT / 'dist'
 DIST.mkdir(exist_ok=True)
 FILES = ['class_manager.py', 'cm_core.py', 'cm_ui.py', 'credential_store.py',
          'test_cm.py', 'test_cm_extended.py', 'test_cm_ui.py', 'README-RU.txt',
-         'requirements.txt', 'computers-example.csv', 'Start-CM.cmd', 'Start-CM.sh', 'Install-CM-Astra.sh',
+         'requirements.txt', 'computers-example.csv', 'Start-CM.cmd', 'Start-CM.pyw', 'Start-CM.sh', 'Install-CM-Astra.sh',
          'docs/first-start.md']
 with tempfile.TemporaryDirectory(prefix='cm-build-', dir=DIST) as temporary:
     stage = Path(temporary) / 'CM-Astra'
@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='cm-build-', dir=DIST) as temporary:
         target = stage / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-        if source.suffix == '.py':
+        if source.suffix in ('.py', '.pyw'):
             ast.parse(target.read_text(encoding='utf-8'), feature_version=(3, 9))
         if source.suffix == '.sh':
             target.chmod(0o755)

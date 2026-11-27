@@ -212,11 +212,15 @@ class Manager:
         self.room_title = tk.StringVar(value='Все кабинеты')
         header.grid_columnconfigure(0, weight=1)
         ttk.Label(header, textvariable=self.room_title, style='Title.TLabel').grid(row=0, column=0, sticky='ew', padx=(0, 12))
+        self.add_pc_button = ttk.Button(header, text='Добавить ПК…', command=self.add_pc_dialog)
+        self.add_pc_button.grid(row=0, column=1, sticky='e', padx=(0, 8))
+        self.controls.append(self.add_pc_button)
+        self.inventory_controls.append(self.add_pc_button)
         check = ttk.Button(header, text='Проверить связь', command=lambda: self.begin('scan'))
-        check.grid(row=0, column=1, sticky='e')
+        check.grid(row=0, column=2, sticky='e')
         self.controls.append(check)
         self.time_sync_button = ttk.Button(header, text='Синхронизировать время', command=self.sync_time_dialog)
-        self.time_sync_button.grid(row=0, column=2, sticky='e', padx=(8, 0))
+        self.time_sync_button.grid(row=0, column=3, sticky='e', padx=(8, 0))
         self.controls.append(self.time_sync_button)
         self.overview = tk.StringVar(value='Компьютеры учеников')
         ttk.Label(main, textvariable=self.overview, style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 12))
@@ -557,6 +561,12 @@ class Manager:
             else:
                 rows = load_hosts(path)
                 rooms = sorted({host.room for host in rows})
+            preview = ', '.join(rooms[:12]) + ('…' if len(rooms) > 12 else '')
+            if not messagebox.askokcancel('Заменить список компьютеров?',
+                    f'Файл содержит ПК: {len(rows)}. Кабинеты: {preview or "нет"}.\n\n'
+                    'Импорт заменит текущие кабинеты и список ПК.',
+                    default='cancel', parent=self.window):
+                return
             save_inventory(self.inventory_file, rooms, rows, domain=self.domain)
             self.hosts = rows
             self.rooms = rooms
@@ -655,6 +665,57 @@ class Manager:
         except Exception as error:
             messagebox.showerror('Класс не удалён', str(error), parent=self.window)
 
+    def add_pc_dialog(self):
+        dialog = tk.Toplevel(self.window)
+        dialog.title('Добавить компьютеры')
+        dialog.transient(self.window)
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill='both', expand=True)
+        destination = tk.StringVar()
+
+        def update_destination():
+            room = self.room.get()
+            if room not in self.rooms:
+                room = sorted(self.rooms)[0] if self.rooms else 'Найденные'
+            destination.set(f'Кабинет по умолчанию: {room}' if self.rooms else
+                            'Кабинетов пока нет. При поиске можно добавить ПК в кабинет «Найденные».')
+
+        def create_room():
+            dialog.grab_release()
+            try:
+                self.add_room()
+                update_destination()
+            finally:
+                dialog.grab_set()
+
+        def open_step(action):
+            dialog.destroy()
+            action()
+
+        def manual():
+            if not self.rooms:
+                self.add_room()
+            if self.rooms:
+                self.add_host()
+
+        ttk.Label(frame, textvariable=destination, wraplength=490).grid(row=0, columnspan=2, sticky='w')
+        ttk.Button(frame, text='Создать кабинет…', command=create_room).grid(row=1, column=0, sticky='w', pady=(6, 12))
+        options = [
+            ('Добавить вручную…', 'Известно имя или адрес одного компьютера.', manual),
+            ('Найти ПК в моей сети…', 'Нужно найти компьютеры в школьной сети.', self.scan_local_network),
+            ('Найти ПК по IP…', 'Известен конкретный IPv4 или диапазон.', self.scan_range),
+            ('Импортировать список…', 'Кабинеты и ПК уже записаны в CSV, LST или JSON.', self.import_list),
+        ]
+        for row, (label, hint, action) in enumerate(options, start=2):
+            ttk.Button(frame, text=label, command=lambda action=action: open_step(action)).grid(
+                row=row, column=0, sticky='ew', pady=4, padx=(0, 12))
+            ttk.Label(frame, text=hint, wraplength=305).grid(row=row, column=1, sticky='w')
+        ttk.Button(frame, text='Закрыть', command=dialog.destroy).grid(row=6, column=1, sticky='e', pady=(12, 0))
+        update_destination()
+        cm_ui.color_widgets(dialog, self.palette)
+        dialog.grab_set()
+        self.window.wait_window(dialog)
+
     def add_host(self):
         self.host_editor()
 
@@ -688,7 +749,7 @@ class Manager:
         broadcast = tk.StringVar(value=original.wol_broadcast if original else '')
         for row, (label, widget) in enumerate([
             ('Имя ПК:', ttk.Entry(frame, textvariable=name, width=42)),
-            ('Класс:', ttk.Combobox(frame, textvariable=room, values=sorted(self.rooms), state='readonly', width=39)),
+            ('Кабинет назначения:', ttk.Combobox(frame, textvariable=room, values=sorted(self.rooms), state='readonly', width=39)),
             ('Адресация:', ttk.Combobox(frame, textvariable=mode, values=('По имени (DHCP / DNS)', 'Постоянный IP'), state='readonly', width=39)),
             ('Постоянный IP:', ttk.Entry(frame, textvariable=ip, width=42)),
             ('Логин SSH:', ttk.Entry(frame, textvariable=username, width=42)),
@@ -914,29 +975,45 @@ class Manager:
         self.refresh()
         self.summary.set('Остановка запрошена для ' + str(requested) + ' ПК. Ожидается подтверждение удалённых процессов.' if requested else 'Выбранные команды уже завершены.')
 
-    def transferred_files(self):
+    def transferred_files(self, selected=None):
         records = []
         for report in sorted((self.data / 'reports').glob('*.json'))[-100:]:
             try:
                 rows = json.loads(report.read_text(encoding='utf-8'))
                 if isinstance(rows, list):
-                    records.extend(rows)
+                    stamp = report.stat().st_mtime_ns
+                    records.extend((stamp, row) for row in rows)
             except (OSError, ValueError):
                 continue
-        records.extend(self.last_results)
+        now = time.time_ns()
+        records.extend((now, row) for row in self.last_results)
         for operation in getattr(getattr(self, 'operations', None), 'active', {}).values():
-            records.extend(operation['results'])
-        groups = {}
-        for row in records:
+            records.extend((now, row) for row in operation['results'])
+
+        observations = []
+        for fallback, row in records:
             if not isinstance(row, dict) or row.get('action') not in ('upload', 'download'):
+                continue
+            host = row.get('name')
+            if not isinstance(host, str) or (selected is not None and host not in selected):
                 continue
             for item in row.get('files', []):
                 try:
-                    spec = file_launch_spec(item['path'], item['sha256'])
-                    name = posixpath.basename(item['path'])
-                    groups.setdefault((name, item['sha256']), {})[row['name']] = spec
+                    path, digest = item['path'], item['sha256']
+                    spec = file_launch_spec(path, digest)
+                    stamp = item.get('completed_at_ns')
+                    observations.append((stamp if isinstance(stamp, int) else fallback, host, path, digest, spec))
                 except (KeyError, TypeError, ValueError):
                     continue
+
+        groups = {}
+        seen_paths = set()
+        # Most recent first. A newer delivery to the same path replaces the old hash.
+        for _, host, path, digest, spec in reversed(sorted(observations, key=lambda item: item[0])):
+            if (host, path) in seen_paths:
+                continue
+            seen_paths.add((host, path))
+            groups.setdefault((posixpath.basename(path), digest), {}).setdefault(host, spec)
         return groups
 
     def launch_dialog(self):
@@ -944,7 +1021,7 @@ class Manager:
         if not selected:
             messagebox.showinfo('Выберите компьютеры', 'Отметьте ПК, на которых нужно запустить переданный файл.', parent=self.window)
             return
-        groups = [(key, targets) for key, targets in self.transferred_files().items() if selected.intersection(targets)]
+        groups = list(self.transferred_files(selected).items())
         if not groups:
             messagebox.showinfo('Нет переданных файлов', 'Передайте .sh или .deb на выбранные ПК. Список берётся из последних 100 отчётов передачи.', parent=self.window)
             return
@@ -956,17 +1033,27 @@ class Manager:
         ttk.Label(frame, text='Выберите файл. Команда и папка будут подставлены; затем проверьте и подтвердите запуск.').pack(anchor='w')
         labels = [key[0] + ' • SHA-256 ' + key[1][:12] + ' • ПК: ' + str(len(selected.intersection(targets))) + '/' + str(len(selected)) for key, targets in groups]
         choice = ttk.Combobox(frame, values=labels, state='readonly', width=95)
-        choice.current(0)
+        default_index = next((i for i, (_, targets) in enumerate(groups) if selected.issubset(targets)), None)
+        if default_index is not None:
+            choice.current(default_index)
         choice.pack(fill='x', pady=10)
         details = tk.StringVar()
         def show_paths(event=None):
-            targets = groups[choice.current()][1]
+            index = choice.current()
+            if index < 0:
+                details.set('Нет файла, переданного на все отмеченные ПК. Выберите файл, чтобы увидеть, на каких ПК его нет.')
+                return
+            targets = groups[index][1]
             details.set('\n'.join(name + ': ' + (targets[name]['expected_file']['path'] if name in targets else 'нет подтверждённой передачи') for name in sorted(selected)))
         choice.bind('<<ComboboxSelected>>', show_paths)
         ttk.Label(frame, textvariable=details, wraplength=850).pack(anchor='w')
         show_paths()
         def prepare():
-            targets = groups[choice.current()][1]
+            index = choice.current()
+            if index < 0:
+                messagebox.showinfo('Выберите файл', 'Снимите отметку с ПК без файла или передайте файл всем отмеченным.', parent=dialog)
+                return
+            targets = groups[index][1]
             missing = sorted(selected.difference(targets))
             if missing:
                 messagebox.showerror('Файл не передан на все выбранные ПК', 'Сначала передайте этот файл или снимите выбор: ' + ', '.join(missing), parent=dialog)
@@ -1255,6 +1342,7 @@ class Manager:
                 tree.item(name, values=values)
         tree.bind('<Button-1>', toggle)
         ttk.Label(frame, text='Выбранные записи добавятся в класс; существующие записи с тем же именем обновятся.').pack(anchor='w', pady=8)
+        ttk.Label(frame, text='Кабинет назначения:').pack(anchor='w')
         rooms = sorted(self.rooms) or ['Найденные']
         destination = tk.StringVar(value=self.room.get() if self.room.get() in rooms else rooms[0])
         ttk.Combobox(frame, textvariable=destination, values=rooms, state='readonly', width=40).pack(anchor='w', pady=5)

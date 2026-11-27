@@ -51,7 +51,7 @@ OUTPUTS.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='cm-build-', dir=OUTPUTS) as temporary:
     OUT = Path(temporary) / 'CM-Astra'
     OUT.mkdir()
-    for name in ['class_manager.py', 'cm_ui.py', 'cm_core.py', 'credential_store.py', 'test_cm.py', 'test_cm_extended.py', 'test_cm_ui.py']:
+    for name in ['class_manager.py', 'cm_ui.py', 'cm_core.py', 'credential_store.py', 'Start-CM.pyw', 'test_cm.py', 'test_cm_extended.py', 'test_cm_ui.py']:
         shutil.copy2(HERE / name, OUT / name)
         ast.parse((OUT / name).read_text(), feature_version=(3, 9))
     (OUT / 'computers.json').write_text('[]')

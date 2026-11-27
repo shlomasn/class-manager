@@ -411,6 +411,58 @@ class WorkbenchTests(unittest.TestCase):
 
 
 
+    def test_launch_defaults_to_recent_file_available_on_all_selected_pcs(self):
+        app = self.app
+        first, second = (host.name for host in app.hosts[:2])
+        app.selected = {first, second}
+        for name in (first, second):
+            app.last_results.append(dict(name=name, action='upload', files=[
+                dict(path='/tmp/first.sh', sha256='a' * 64, completed_at_ns=1),
+                dict(path='/tmp/second.sh', sha256='b' * 64, completed_at_ns=2),
+            ]))
+        app.last_results.append(dict(name=first, action='upload', files=[
+            dict(path='/tmp/partial.sh', sha256='c' * 64, completed_at_ns=3),
+        ]))
+        defaults = []
+
+        def choose():
+            dialog = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
+            frame = dialog.winfo_children()[0]
+            picker = next(w for w in frame.winfo_children() if isinstance(w, ttk.Combobox))
+            defaults.append(picker.get())
+            next(w for w in frame.winfo_children() if isinstance(w, ttk.Button)
+                 and w.cget('text') == 'Подготовить команду…').invoke()
+
+        self.root.after(50, choose)
+        with patch.object(app, 'command_dialog') as prepare, patch.object(app, 'begin') as execute:
+            app.launch_dialog()
+        self.assertTrue(defaults[0].startswith('second.sh'))
+        self.assertEqual(set(prepare.call_args.args[0]['targets']), {first, second})
+        execute.assert_not_called()
+
+    def test_add_pc_button_opens_chooser_with_room_and_dispatches_search(self):
+        app = self.app
+        app.room.set(app.rooms[0])
+        labels = []
+
+        def choose():
+            dialog = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
+            frame = dialog.winfo_children()[0]
+            for widget in frame.winfo_children():
+                if isinstance(widget, ttk.Button):
+                    labels.append(widget.cget('text'))
+                elif isinstance(widget, ttk.Label) and widget.cget('textvariable'):
+                    labels.append(self.root.getvar(widget.cget('textvariable')))
+            next(w for w in frame.winfo_children() if isinstance(w, ttk.Button)
+                 and w.cget('text') == 'Найти ПК по IP…').invoke()
+
+        self.root.after(50, choose)
+        with patch.object(app, 'scan_range') as search:
+            app.add_pc_button.invoke()
+        self.assertIn(f'Кабинет по умолчанию: {app.rooms[0]}', labels)
+        self.assertTrue({'Добавить вручную…', 'Найти ПК в моей сети…', 'Импортировать список…'}.issubset(labels))
+        search.assert_called_once_with()
+
     def test_auto_network_dialog_cancel_does_not_scan(self):
         app=self.app
         rows=[dict(interface='LAN',ip='192.168.2.10',network='192.168.2.0/24')]

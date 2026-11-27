@@ -868,7 +868,8 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
                 except Exception:
                     pass
                 raise
-            result['files'].append(dict(path=target, sha256=local_hash, bytes=before.st_size))
+            result['files'].append(dict(path=target, sha256=local_hash, bytes=before.st_size,
+                                        completed_at_ns=time.time_ns()))
         notify('Готово')
         result.update(ok=True, message='Передано файлов: ' + str(len(result['files'])) + ', пропущено: ' + str(len(result['skipped'])), output='\n'.join(item['path'] for item in result['files']))
     except TransferStopped as error:
