@@ -231,7 +231,7 @@ class WorkbenchTests(unittest.TestCase):
     def test_all_inventory_password_and_power_actions_stay_available_in_menus(self):
         labels = {menu.entrycget(index, 'label'): (menu, index, inventory) for menu, index, inventory in self.app.menu_controls}
         expected = ['Добавить ПК…', 'Изменить выбранную строку…', 'Удалить отмеченные ПК…',
-                    'Перенести отмеченные в кабинет…', 'Импорт списка .csv / .lst / .json…', 'Найти ПК по IP…',
+                    'Перенести отмеченные в кабинет…', 'Импорт списка .csv / .lst / .json…', 'Найти ПК…',
                     'Добавить кабинет…', 'Удалить текущий кабинет…', 'Сохранить / изменить пароль…',
                     'Забыть сохранённый пароль', 'Выключить…', 'Перезагрузить…',
                     'Отменить запланированное выключение / перезагрузку…',
@@ -454,13 +454,13 @@ class WorkbenchTests(unittest.TestCase):
                 elif isinstance(widget, ttk.Label) and widget.cget('textvariable'):
                     labels.append(self.root.getvar(widget.cget('textvariable')))
             next(w for w in frame.winfo_children() if isinstance(w, ttk.Button)
-                 and w.cget('text') == 'Найти ПК по IP…').invoke()
+                 and w.cget('text') == 'Найти ПК…').invoke()
 
         self.root.after(50, choose)
-        with patch.object(app, 'scan_range') as search:
+        with patch.object(app, 'scan_local_network') as search:
             app.add_pc_button.invoke()
         self.assertIn(f'Кабинет по умолчанию: {app.rooms[0]}', labels)
-        self.assertTrue({'Добавить вручную…', 'Найти ПК в моей сети…', 'Импортировать список…'}.issubset(labels))
+        self.assertTrue({'Добавить вручную…', 'Найти ПК…', 'Импортировать список…'}.issubset(labels))
         search.assert_called_once_with()
 
     def test_auto_network_dialog_cancel_does_not_scan(self):
@@ -478,28 +478,72 @@ class WorkbenchTests(unittest.TestCase):
             app.choose_local_network(rows)
         start.assert_not_called()
 
-    def test_auto_network_dialog_scans_another_block_inside_detected_subnet(self):
-        app=self.app
-        rows=[dict(interface='Wi-Fi',ip='10.20.30.10',network='10.20.0.0/16')]
-        def start():
-            dialog=next(w for w in self.root.winfo_children() if isinstance(w,tk.Toplevel))
-            def widgets(parent):
-                for w in parent.winfo_children():
-                    yield w
-                    yield from widgets(w)
-            target = next(w for w in widgets(dialog) if isinstance(w, ttk.Entry) and not isinstance(w, ttk.Combobox))
-            self.assertEqual(target.get(), '10.20.30.10')
-            target.delete(0, 'end')
-            target.insert(0, '10.20.87.55')
-            next(w for w in widgets(dialog) if isinstance(w,ttk.Button) and w.cget('text')=='Найти компьютеры').invoke()
-        self.root.after(50,start)
-        with patch.object(app,'start_scan') as scan:
-            app.choose_local_network(rows)
-        ips=scan.call_args.args[0]
-        self.assertEqual(len(ips),256)
-        self.assertEqual(ips[0],'10.20.87.0')
-        self.assertIn('10.20.87.55', ips)
-        self.assertNotIn('10.20.30.10',ips)
+    def test_search_dialog_supports_the_full_subnet_and_manual_ranges(self):
+        app = self.app
+        rows = [dict(interface='Wi-Fi', ip='10.20.30.10', network='10.20.0.0/16')]
+        for manual in (False, True):
+            def start():
+                dialog = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
+                widgets = dialog.winfo_children()[0].winfo_children()
+                if manual:
+                    next(w for w in widgets if isinstance(w, ttk.Radiobutton) and w.cget('value') == 'manual').invoke()
+                    target = next(w for w in widgets if type(w) is ttk.Entry)
+                    target.insert(0, '10.20.87.55 - 10.20.87.57, 10.20.30.10')
+                bar = next(w for w in widgets if isinstance(w, ttk.Frame))
+                next(w for w in bar.winfo_children() if w.cget('text') == 'Найти компьютеры').invoke()
+            self.root.after(50, start)
+            with patch.object(app, 'start_scan') as scan:
+                app.choose_local_network(rows)
+            ips = scan.call_args.args[0]
+            if manual:
+                self.assertEqual(list(ips), ['10.20.87.55', '10.20.87.56', '10.20.87.57'])
+            else:
+                self.assertEqual(len(ips), 65533)
+                self.assertIn('10.20.87.55', ips)
+                self.assertNotIn('10.20.30.10', ips)
+
+    def test_rename_cabinet_preserves_its_computers_and_shift_uses_sorted_view(self):
+        app = self.app
+        original = app.rooms[0]
+        names = {host.name for host in app.hosts if host.room == original}
+        app.room.set(original)
+        app.change_room()
+        with patch.object(gui.simpledialog, 'askstring', return_value='Новое имя'):
+            app.rename_room()
+        rooms, hosts = core.load_inventory(app.inventory_file)
+        self.assertNotIn(original, rooms)
+        self.assertEqual({host.name for host in hosts if host.room == 'Новое имя'}, names)
+        app.sort_table('name')
+        app.sort_table('name')
+        order = app.table.get_children()
+        self.root.update()
+        x,y,width,height = app.table.bbox(order[1], '#2')
+        app.clicked(types.SimpleNamespace(x=x+1, y=y+height//2, state=0))
+        x,y,width,height = app.table.bbox(order[4], '#2')
+        app.clicked(types.SimpleNamespace(x=x+1, y=y+height//2, state=1))
+        self.assertEqual(app.selected, set(order[1:5]))
+
+    def test_new_discovered_pc_defaults_to_all_computers_without_creating_room(self):
+        app = self.app
+        rooms_before = list(app.rooms)
+        row = dict(name='found-pc', ip='10.55.1.20', mode='fixed', ok=True,
+                   type='ssh-ed25519', key='test-key', fingerprint='SHA256:test')
+        def add():
+            dialog = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
+            frame = dialog.winfo_children()[0]
+            picker = next(w for w in frame.winfo_children() if isinstance(w, ttk.Combobox))
+            self.assertEqual(picker.get(), 'Все компьютеры')
+            bar = next(w for w in frame.winfo_children() if isinstance(w, ttk.Frame))
+            buttons = {w.cget('text'): w for w in bar.winfo_children()}
+            buttons['Выбрать все'].invoke()
+            buttons['Добавить выбранные'].invoke()
+        self.root.after(50, add)
+        app.range_results([row])
+        rooms, hosts = core.load_inventory(app.inventory_file)
+        self.assertEqual(rooms, rooms_before)
+        self.assertEqual(next(h for h in hosts if h.name == row['name']).room, '')
+        self.assertIn(row['name'], app.table.get_children())
+        self.assertEqual(app.room_title.get(), 'Все компьютеры')
 
 
     def test_mac_editor_fields_save_without_touching_credentials(self):

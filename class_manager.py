@@ -1,5 +1,5 @@
 """Class Manager for a Windows teacher computer controlling Astra over SSH."""
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, replace
 import datetime
 import json
@@ -14,11 +14,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import uuid
 
-from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, load_profile_inventory, save_inventory, transfer_files, execute_command, parse_addresses, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan, mac_address, wake_plan, collect_mac, wake_computer
+from cm_core import Host, atomic_json, classify_key, execute, load_hosts, probe, hostname, room_name, validate_hosts, load_inventory, load_profile_inventory, save_inventory, transfer_files, execute_command, scan_targets, probe_address, inspect_address, same_key, remote_path, DEFAULT_INBOX, file_launch_spec, prepare_transfer, TransferAccessGate, OperationControl, OperationCancelled, CommandControl, synchronize_time, load_csv, dns_domain, detect_local_networks, automatic_scan_plan, mac_address, wake_plan, collect_mac, wake_computer
 import credential_store
 import cm_ui
 
 ROOT = Path(__file__).resolve().parent
+ALL_COMPUTERS = 'Все кабинеты'  # Internal filter value, distinct from a stored cabinet.
+ALL_COMPUTERS_LABEL = 'Все компьютеры'
+UNASSIGNED_LABEL = 'Без кабинета'
 
 
 def password_for(passwords, name):
@@ -98,7 +101,7 @@ class Manager:
                 self.inventory_file, legacy_network=legacy_network)
         else:
             self.hosts = load_hosts(self.host_file if self.host_file.exists() else ROOT / 'computers.json')
-            self.rooms = sorted({host.room for host in self.hosts})
+            self.rooms = sorted({host.room for host in self.hosts if host.room})
             self.domain = self.hosts[0].domain if self.hosts else ''
             if legacy_network.exists():
                 self.domain = dns_domain(json.loads(legacy_network.read_text(encoding='utf-8')).get('domain', ''))
@@ -116,6 +119,7 @@ class Manager:
         self.last_results = []
         self.last_ips = {}
         self.selected = set()
+        self.selection_anchor = None
         self.sort_column = None
         self.sort_reverse = False
         self.statuses = {}
@@ -159,7 +163,7 @@ class Manager:
         ttk.Label(sidebar, text='КАБИНЕТЫ', style='Side.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 8))
         room_frame = ttk.Frame(sidebar, style='Surface.TFrame')
         room_frame.grid(row=2, column=0, sticky='nsew')
-        self.room = tk.StringVar(value='Все кабинеты')
+        self.room = tk.StringVar(value=ALL_COMPUTERS)
         self.room_list = ttk.Treeview(room_frame, show='tree', selectmode='browse', style='Rooms.Treeview', height=5)
         self.room_list.column('#0', width=142, minwidth=80, stretch=True)
         self.room_list.pack(side='left', fill='both', expand=True)
@@ -178,11 +182,12 @@ class Manager:
         menu.add_cascade(label='Компьютеры', menu=computers)
         for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
                               ('Удалить отмеченные ПК…', self.remove_hosts), ('Перенести отмеченные в кабинет…', self.move_hosts),
-                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Получить MAC выбранных ПК…', lambda: self.begin('collect_mac')), ('Найти ПК в моей сети…', self.scan_local_network), ('Найти ПК по IP…', self.scan_range)]:
+                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Получить MAC выбранных ПК…', lambda: self.begin('collect_mac')), ('Найти ПК…', self.scan_local_network)]:
             self.menu_action(computers, text, command, inventory=True)
         rooms = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Кабинеты', menu=rooms)
         self.menu_action(rooms, 'Добавить кабинет…', self.add_room, inventory=True)
+        self.menu_action(rooms, 'Переименовать текущий кабинет…', self.rename_room, inventory=True)
         self.menu_action(rooms, 'Удалить текущий кабинет…', self.remove_room, inventory=True)
         menu.add_separator()
         profile = tk.Menu(menu, tearoff=False)
@@ -209,7 +214,7 @@ class Manager:
         main.grid_rowconfigure(4, weight=1, minsize=85)
         header = ttk.Frame(main)
         header.grid(row=0, column=0, sticky='ew', pady=(0, 8))
-        self.room_title = tk.StringVar(value='Все кабинеты')
+        self.room_title = tk.StringVar(value=ALL_COMPUTERS_LABEL)
         header.grid_columnconfigure(0, weight=1)
         ttk.Label(header, textvariable=self.room_title, style='Title.TLabel').grid(row=0, column=0, sticky='ew', padx=(0, 12))
         self.add_pc_button = ttk.Button(header, text='Добавить ПК…', command=self.add_pc_dialog)
@@ -310,8 +315,10 @@ class Manager:
         footer.grid(row=6, column=0, sticky='ew')
         self.progress = ttk.Progressbar(footer, mode='indeterminate')
         self.progress.pack(fill='x', pady=(0, 6))
-        self.summary = tk.StringVar(value='Отметьте нужные ПК. Для остановки можно отметить и занятые компьютеры.')
+        self.summary = tk.StringVar(value='Отметьте ПК. Shift + щелчок выделяет диапазон строк.')
         self.summary_label = ttk.Label(footer, textvariable=self.summary, style='Muted.TLabel', wraplength=730)
+        self.scan_control = None
+        self.cancel_scan_button = ttk.Button(footer, text='Остановить поиск', command=self.cancel_scan)
         self.summary_label.pack(fill='x', anchor='w')
         main.bind('<Configure>', lambda event: self.summary_label.configure(wraplength=max(240, event.width - 44)))
 
@@ -338,7 +345,7 @@ class Manager:
                 self.room_list.delete(identifier)
         for index, (name, count) in enumerate(entries):
             identifier = 'room-' + str(index)
-            text = ('Все кабинеты' if index == 0 else 'Кабинет ' + name) + '  ·  ' + str(count)
+            text = (ALL_COMPUTERS_LABEL if index == 0 else 'Кабинет ' + name) + '  ·  ' + str(count)
             if self.room_list.exists(identifier):
                 self.room_list.item(identifier, text=text)
             else:
@@ -363,7 +370,7 @@ class Manager:
         busy = sum(host.name in occupied for host in visible)
         selected = sum(host.name in self.selected for host in visible)
         errors = sum(self.statuses.get(host.name, ('', False))[1] for host in visible if host.name not in occupied)
-        self.room_title.set(self.room.get() if self.room.get() == 'Все кабинеты' else 'Кабинет ' + self.room.get())
+        self.room_title.set(ALL_COMPUTERS_LABEL if self.room.get() == ALL_COMPUTERS else 'Кабинет ' + self.room.get())
         self.overview.set(str(len(visible)) + ' ПК в списке  ·  Занято: ' + str(busy) + '  ·  Требуют внимания: ' + str(errors))
         self.counter.set('Выбрано: ' + str(selected))
         rows = cm_ui.operation_entries(self.operations.active)
@@ -428,13 +435,13 @@ class Manager:
 
     def visible(self):
         room = self.room.get()
-        return [h for h in self.hosts if room == 'Все кабинеты' or h.room == room]
+        return [h for h in self.hosts if room == ALL_COMPUTERS or h.room == room]
 
     def refresh(self):
         if hasattr(self, 'room_list'):
             self.refresh_rooms()
         else:
-            self.room_box['values'] = ['Все кабинеты'] + sorted(self.rooms)
+            self.room_box['values'] = [ALL_COMPUTERS] + sorted(self.rooms)
         rows = []
         for host in self.visible():
             chosen = host.name in self.selected
@@ -467,6 +474,7 @@ class Manager:
     def change_room(self):
         # A hidden selection must never shut down computers from another classroom.
         self.selected.clear()
+        self.selection_anchor = None
         self.refresh()
 
     def clicked(self, event):
@@ -474,9 +482,14 @@ class Manager:
             return
         column = self.table.identify_column(event.x)
         name = self.table.identify_row(event.y)
+        if name and event.state & 0x0001 and column != '#5':
+            self.select_through(name)
+            return 'break'
         if column == '#5':
             return self.stop_for_host(name)
         if column != '#1':
+            if name:
+                self.selection_anchor = name
             return
         if name:
             self.toggle(name)
@@ -497,6 +510,20 @@ class Manager:
             self.selected.remove(name)
         else:
             self.selected.add(name)
+        self.selection_anchor = name
+        self.refresh()
+        self.table.focus(name)
+
+    def select_through(self, name):
+        order = self.table.get_children()
+        anchor = self.selection_anchor if self.selection_anchor in order else name
+        low, high = sorted((order.index(anchor), order.index(name)))
+        owners = self.operations.owners
+        for host in order[low:high + 1]:
+            action = self.operations.active.get(owners.get(host), {}).get('action')
+            if host not in owners or action in ('distribute', 'command', 'wake'):
+                self.selected.add(host)
+        self.selection_anchor = anchor
         self.refresh()
         self.table.focus(name)
 
@@ -506,6 +533,7 @@ class Manager:
         self.refresh()
 
     def clear_selection(self):
+        self.selection_anchor = None
         self.selected.clear()
         self.refresh()
 
@@ -543,7 +571,7 @@ class Manager:
         self.last_ips.clear()
         self.selected.clear()
         self.statuses.clear()
-        self.room.set('Все кабинеты')
+        self.room.set(ALL_COMPUTERS)
         self.refresh()
         self.summary.set('Данные школы восстановлены: ' + Path(path).name)
 
@@ -560,7 +588,7 @@ class Manager:
                 rooms, rows = load_inventory(path)
             else:
                 rows = load_hosts(path)
-                rooms = sorted({host.room for host in rows})
+                rooms = sorted({host.room for host in rows if host.room})
             preview = ', '.join(rooms[:12]) + ('…' if len(rooms) > 12 else '')
             if not messagebox.askokcancel('Заменить список компьютеров?',
                     f'Файл содержит ПК: {len(rows)}. Кабинеты: {preview or "нет"}.\n\n'
@@ -573,7 +601,7 @@ class Manager:
             self.last_ips.clear()
             self.selected.clear()
             self.statuses.clear()
-            self.room.set('Все кабинеты')
+            self.room.set(ALL_COMPUTERS)
             self.refresh()
             self.summary.set('Загружен список: ' + Path(path).name)
         except Exception as error:
@@ -600,7 +628,7 @@ class Manager:
         self.selected.clear()
         self.last_ips.clear()
         self.statuses.clear()
-        self.room.set('Все кабинеты')
+        self.room.set(ALL_COMPUTERS)
         self.refresh()
         self.summary.set('CSV импортирован. Пароли задаются в карточках ПК или при подключении.')
 
@@ -633,7 +661,7 @@ class Manager:
         save_inventory(self.inventory_file, self.rooms, self.hosts, domain=self.domain)
 
     def add_room(self):
-        value = simpledialog.askstring('Добавить класс', 'Название класса, например 208:', parent=self.window)
+        value = simpledialog.askstring('Добавить класс', 'Введите название кабинета', parent=self.window)
         if value is None:
             return
         try:
@@ -647,23 +675,48 @@ class Manager:
         except Exception as error:
             messagebox.showerror('Класс не добавлен', str(error), parent=self.window)
 
+    def rename_room(self):
+        old = self.room.get()
+        if old not in self.rooms:
+            messagebox.showinfo('Выберите кабинет', 'Выберите кабинет слева.', parent=self.window)
+            return
+        value = simpledialog.askstring('Переименовать кабинет', 'Введите новое название',
+                                       initialvalue=old, parent=self.window)
+        if value is None:
+            return
+        try:
+            name = room_name(value)
+            if name == old:
+                return
+            if name in self.rooms:
+                raise ValueError('Кабинет с таким названием уже есть')
+            rooms = [name if room == old else room for room in self.rooms]
+            hosts = [replace(host, room=name) if host.room == old else host for host in self.hosts]
+            save_inventory(self.inventory_file, rooms, hosts, domain=self.domain)
+            self.rooms, self.hosts = rooms, hosts
+            self.room.set(name)
+            self.change_room()
+        except Exception as error:
+            messagebox.showerror('Кабинет не переименован', str(error), parent=self.window)
+
     def remove_room(self):
         room = self.room.get()
-        if room == 'Все кабинеты':
-            messagebox.showinfo('Выберите класс', 'Выберите удаляемый класс в списке кабинетов.', parent=self.window)
+        if room not in self.rooms:
+            messagebox.showinfo('Выберите кабинет', 'Выберите кабинет слева.', parent=self.window)
             return
         count = sum(host.room == room for host in self.hosts)
-        if not messagebox.askyesno('Удалить класс', 'Удалить класс «' + room + '» и его записи ПК (' + str(count) + ')?\nСами компьютеры и домен не изменятся.', default='no', parent=self.window):
+        if not messagebox.askyesno('Удалить кабинет', f'Удалить кабинет «{room}»? Его ПК ({count}) останутся во «Все компьютеры».',
+                                   default='no', parent=self.window):
             return
         try:
             rooms = [value for value in self.rooms if value != room]
-            hosts = [host for host in self.hosts if host.room != room]
+            hosts = [replace(host, room='') if host.room == room else host for host in self.hosts]
             save_inventory(self.inventory_file, rooms, hosts, domain=self.domain)
             self.rooms, self.hosts = rooms, hosts
-            self.room.set('Все кабинеты')
+            self.room.set(ALL_COMPUTERS)
             self.change_room()
         except Exception as error:
-            messagebox.showerror('Класс не удалён', str(error), parent=self.window)
+            messagebox.showerror('Кабинет не удалён', str(error), parent=self.window)
 
     def add_pc_dialog(self):
         dialog = tk.Toplevel(self.window)
@@ -675,10 +728,8 @@ class Manager:
 
         def update_destination():
             room = self.room.get()
-            if room not in self.rooms:
-                room = sorted(self.rooms)[0] if self.rooms else 'Найденные'
-            destination.set(f'Кабинет по умолчанию: {room}' if self.rooms else
-                            'Кабинетов пока нет. При поиске можно добавить ПК в кабинет «Найденные».')
+            destination.set(f'Кабинет по умолчанию: {room}' if room in self.rooms else
+                            'Новые ПК появятся в списке «Все компьютеры». Кабинет можно выбрать позже.')
 
         def create_room():
             dialog.grab_release()
@@ -692,18 +743,11 @@ class Manager:
             dialog.destroy()
             action()
 
-        def manual():
-            if not self.rooms:
-                self.add_room()
-            if self.rooms:
-                self.add_host()
-
         ttk.Label(frame, textvariable=destination, wraplength=490).grid(row=0, columnspan=2, sticky='w')
         ttk.Button(frame, text='Создать кабинет…', command=create_room).grid(row=1, column=0, sticky='w', pady=(6, 12))
         options = [
-            ('Добавить вручную…', 'Известно имя или адрес одного компьютера.', manual),
-            ('Найти ПК в моей сети…', 'Нужно найти компьютеры в школьной сети.', self.scan_local_network),
-            ('Найти ПК по IP…', 'Известен конкретный IPv4 или диапазон.', self.scan_range),
+            ('Добавить вручную…', 'Известно имя или адрес одного компьютера.', self.add_host),
+            ('Найти ПК…', 'Вся локальная подсеть или указанный диапазон IP.', self.scan_local_network),
             ('Импортировать список…', 'Кабинеты и ПК уже записаны в CSV, LST или JSON.', self.import_list),
         ]
         for row, (label, hint, action) in enumerate(options, start=2):
@@ -728,17 +772,14 @@ class Manager:
         self.host_editor(host)
 
     def host_editor(self, original=None):
-        if not self.rooms:
-            messagebox.showinfo('Добавьте класс', 'Сначала нажмите «Добавить класс».', parent=self.window)
-            return
         dialog = tk.Toplevel(self.window)
         dialog.title('Изменить компьютер' if original else 'Добавить компьютер')
         dialog.transient(self.window)
         frame = ttk.Frame(dialog, padding=18)
         frame.pack(fill='both', expand=True)
         name = tk.StringVar(value=original.name if original else '')
-        selected_room = self.room.get() if self.room.get() in self.rooms else sorted(self.rooms)[0]
-        room = tk.StringVar(value=original.room if original else selected_room)
+        selected_room = self.room.get() if self.room.get() in self.rooms else ''
+        room = tk.StringVar(value=(original.room if original else selected_room) or UNASSIGNED_LABEL)
         mode = tk.StringVar(value='По имени (DHCP / DNS)' if not original or original.mode == 'dns' else 'Постоянный IP')
         ip = tk.StringVar(value=original.ip if original and original.mode == 'fixed' else '')
         username = tk.StringVar(value=original.username if original else 'user')
@@ -747,16 +788,20 @@ class Manager:
         erase = tk.BooleanVar(value=False)
         mac = tk.StringVar(value=original.mac if original else '')
         broadcast = tk.StringVar(value=original.wol_broadcast if original else '')
+        room_choice = ttk.Combobox(frame, textvariable=room, values=[UNASSIGNED_LABEL] + sorted(self.rooms),
+                                   state='readonly', width=39)
+        assigned_room = original.room if original else selected_room
+        room_choice.current(1 + sorted(self.rooms).index(assigned_room) if assigned_room else 0)
         for row, (label, widget) in enumerate([
             ('Имя ПК:', ttk.Entry(frame, textvariable=name, width=42)),
-            ('Кабинет назначения:', ttk.Combobox(frame, textvariable=room, values=sorted(self.rooms), state='readonly', width=39)),
+            ('Кабинет назначения:', room_choice),
             ('Адресация:', ttk.Combobox(frame, textvariable=mode, values=('По имени (DHCP / DNS)', 'Постоянный IP'), state='readonly', width=39)),
             ('Постоянный IP:', ttk.Entry(frame, textvariable=ip, width=42)),
             ('Логин SSH:', ttk.Entry(frame, textvariable=username, width=42)),
             ('Пароль:', ttk.Entry(frame, textvariable=password, show='*', width=42)),
             ('Учётная запись:', ttk.Combobox(frame, textvariable=credentials, values=('Общий user', 'Для этого ПК'), state='readonly', width=39)),
-            ('MAC адаптера:', ttk.Entry(frame, textvariable=mac, width=42)),
-            ('Адрес рассылки WoL:', ttk.Entry(frame, textvariable=broadcast, width=42))]):
+            ('MAC адаптера (необязательно):', ttk.Entry(frame, textvariable=mac, width=42)),
+            ('Адрес рассылки WoL (необязательно):', ttk.Entry(frame, textvariable=broadcast, width=42))]):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
             widget.grid(row=row, column=1, sticky='ew', pady=6)
             if row == 0:
@@ -767,13 +812,13 @@ class Manager:
             ip_entry.configure(state='disabled' if mode.get().startswith('По имени') else 'normal')
         frame.grid_slaves(row=2, column=1)[0].bind('<<ComboboxSelected>>', mode_changed)
         mode_changed()
-        ttk.Label(frame, text='Имя разрешается через настройки сети учителя.\nMAC-адаптер: ' + ((original.mac_interface or 'не указан') + ' · ' + {'wifi': 'Wi-Fi (включение не гарантируется)', 'ethernet': 'Ethernet', 'manual': 'введён вручную', '': 'тип не определён'}.get(original.mac_type, '') if original else 'не определён')).grid(row=9, columnspan=2, sticky='w', pady=12)
+        ttk.Label(frame, text='MAC и адрес WoL можно заполнить позже командой «Получить MAC выбранных ПК…».\nMAC-адаптер: ' + ((original.mac_interface or 'не указан') + ' · ' + {'wifi': 'Wi-Fi (включение не гарантируется)', 'ethernet': 'Ethernet', 'manual': 'введён вручную', '': 'тип не определён'}.get(original.mac_type, '') if original else 'не определён')).grid(row=9, columnspan=2, sticky='w', pady=12)
         ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=10, columnspan=2, sticky='w')
         ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=11, columnspan=2, sticky='w', pady=8)
         def save():
             try:
                 dns = mode.get().startswith('По имени')
-                candidate = dict(name=hostname(name.get()), room=room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain, mac=mac.get(), wol_broadcast=broadcast.get(),
+                candidate = dict(name=hostname(name.get()), room='' if room_choice.current() == 0 else room.get(), ip='' if dns else ip.get(), mode='dns' if dns else 'fixed', username=username.get(), credential_mode='host' if credentials.get() == 'Для этого ПК' or password.get() else 'shared', domain=original.domain if original else self.domain, mac=mac.get(), wol_broadcast=broadcast.get(),
                     mac_type=original.mac_type if original and mac.get() and mac_address(mac.get()) == original.mac else ('manual' if mac.get() else ''),
                     mac_interface=original.mac_interface if original and mac.get() and mac_address(mac.get()) == original.mac else '')
                 rows = [asdict(h) for h in self.hosts if original is None or h.name != original.name]
@@ -875,6 +920,9 @@ class Manager:
         targets = {host.name for host in self.visible() if host.name in self.selected}
         if not targets:
             messagebox.showinfo('Выберите ПК', 'Отметьте компьютеры для переноса в класс.', parent=self.window)
+            return
+        if not self.rooms:
+            messagebox.showinfo('Создайте кабинет', 'Сначала добавьте кабинет через «Добавить ПК…».', parent=self.window)
             return
         dialog = tk.Toplevel(self.window)
         dialog.title('Перенести компьютеры в класс')
@@ -1140,74 +1188,76 @@ class Manager:
 
     def detect_network_worker(self):
         try:
-            self.events.put(('local_networks', detect_local_networks()))
+            self.events.put(('local_networks', (detect_local_networks(), '')))
         except Exception as error:
-            self.events.put(('error', str(error)))
+            self.events.put(('local_networks', ([], str(error))))
 
-    def choose_local_network(self, rows):
+    def choose_local_network(self, rows, detection_error=''):
         self.set_busy(False)
-        if not rows:
-            messagebox.showinfo('Локальные сети', 'Активных локальных IPv4-сетей не найдено. Проверьте подключение или используйте ручной диапазон IP.', parent=self.window)
-            return
         dialog = tk.Toplevel(self.window)
-        dialog.title('Найти ПК в моей сети')
+        dialog.title('Найти компьютеры')
         dialog.transient(self.window)
         frame = ttk.Frame(dialog, padding=18)
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Выберите школьное подключение. VPN и виртуальные интерфейсы тоже могут быть в списке.').pack(anchor='w')
-        labels = [row['interface'] + ' · IP ' + row['ip'] + ' · сеть ' + row['network'] for row in rows]
-        choice = ttk.Combobox(frame, values=labels, state='readonly', width=85)
-        choice.pack(fill='x', pady=10)
-        choice.current(0)
-        info = tk.StringVar()
-        ttk.Label(frame, textvariable=info, wraplength=640).pack(anchor='w', pady=6)
-        target_ip = tk.StringVar()
-        target_row = ttk.Frame(frame)
-        target_row.pack(fill='x', pady=6)
-        ttk.Label(target_row, text='IP из нужного кабинета:').pack(side='left')
-        target_entry = ttk.Entry(target_row, textvariable=target_ip, width=20)
-        target_entry.pack(side='left', padx=8)
+        mode = tk.StringVar(value='auto' if rows else 'manual')
+        auto = ttk.Radiobutton(frame, text='Вся подсеть компьютера учителя', variable=mode, value='auto')
+        auto.pack(anchor='w')
+        labels = [f"{row['interface']} · IP {row['ip']} · сеть {row['network']}" for row in rows]
+        choice = ttk.Combobox(frame, values=labels, state='readonly', width=68)
+        choice.pack(fill='x', pady=(4, 10))
+        if rows:
+            choice.current(0)
+        else:
+            auto.state(['disabled'])
+            ttk.Label(frame, text=detection_error or 'Активная локальная IPv4-сеть не найдена.',
+                      wraplength=530).pack(anchor='w', pady=(0, 8))
+
+        ttk.Radiobutton(frame, text='Указать IP-адреса или диапазоны', variable=mode, value='manual').pack(anchor='w')
+        manual = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=manual)
+        entry.pack(fill='x', pady=4)
+        ttk.Label(frame, text='Пример: 172.22.42.1-172.22.42.32, 172.22.87.55').pack(anchor='w')
         preview = tk.StringVar()
-        ttk.Label(frame, textvariable=preview, wraplength=640).pack(anchor='w', pady=8)
+        ttk.Label(frame, textvariable=preview, wraplength=530).pack(anchor='w', pady=(12, 5))
+        ttk.Label(frame, text='Сначала CM покажет адреса с доступным SSH. Затем можно проверить и добавить нужные ПК.',
+                  wraplength=530).pack(anchor='w', pady=(0, 10))
+
         own_ips = {row['ip'] for row in rows}
 
-        def current_plan():
-            row = rows[choice.current()]
-            target = target_ip.get().strip() if target_entry.instate(['!disabled']) else None
-            return automatic_scan_plan(row, exclude=own_ips, target_ip=target)
+        def targets():
+            if mode.get() == 'auto':
+                row = rows[choice.current()]
+                return automatic_scan_plan(row, exclude=own_ips)['addresses']
+            return scan_targets(manual.get(), exclude=own_ips)
 
-        def show_plan(*args):
+        def update(*args):
+            automatic = mode.get() == 'auto'
+            choice.configure(state='readonly' if automatic else 'disabled')
+            entry.configure(state='disabled' if automatic else 'normal')
             try:
-                plan = current_plan()
-                preview.set(f"Диапазон поиска: {plan['network']}. Будет проверено адресов: {len(plan['addresses'])}.")
+                count = len(targets())
             except ValueError:
-                preview.set(f"Введите IPv4 из сети {rows[choice.current()]['network']}.")
+                preview.set('Введите IP или диапазон. Несколько адресов можно разделить запятыми.')
+            else:
+                preview.set(f'Будет проверено адресов: {count:,}.'.replace(',', ' '))
+        mode.trace_add('write', update)
+        manual.trace_add('write', update)
+        choice.bind('<<ComboboxSelected>>', update)
+        update()
 
-        def selected(event=None):
-            row = rows[choice.current()]
-            plan = automatic_scan_plan(row, exclude=own_ips)
-            target_entry.configure(state='normal' if plan['partial'] else 'disabled')
-            info.set('В большой сети CM проверяет один участок /24 за раз. По умолчанию это участок учителя. '
-                     'Для другого кабинета введите один IP из его участка. Этот ПК может быть выключен.'
-                     if plan['partial'] else 'Будет проверена вся выбранная подсеть.')
-            target_ip.set(row['ip'])
-
-        target_ip.trace_add('write', show_plan)
-        choice.bind('<<ComboboxSelected>>', selected)
-        selected()
-        ttk.Label(frame, text='Поиск обнаруживает доступные SSH-серверы. Затем проверяются имя и Astra;\nвы сами выбираете, какие ПК добавить. Без SSH компьютер не появится в результатах.').pack(anchor='w', pady=8)
-        bar = ttk.Frame(frame)
-        bar.pack(fill='x', pady=8)
         def search():
             try:
-                plan = current_plan()
-                if not plan['addresses']:
-                    raise ValueError('В этой сети нет других адресов для поиска')
-            except (ValueError, IndexError) as error:
-                messagebox.showerror('Локальная сеть', f"Проверьте IP и выбранное подключение. {error}", parent=dialog)
+                addresses = targets()
+                if not addresses:
+                    raise ValueError('В выбранном диапазоне нет других адресов.')
+            except ValueError as error:
+                messagebox.showerror('Поиск компьютеров', str(error), parent=dialog)
                 return
             dialog.destroy()
-            self.start_scan(plan['addresses'])
+            self.start_scan(addresses)
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill='x')
         ttk.Button(bar, text='Найти компьютеры', command=search).pack(side='left')
         ttk.Button(bar, text='Отмена', command=dialog.destroy).pack(side='right')
         cm_ui.color_widgets(dialog, self.palette)
@@ -1216,41 +1266,110 @@ class Manager:
 
     def start_scan(self, addresses):
         self.set_busy(True)
-        self.summary.set('Поиск SSH-серверов: ' + str(len(addresses)) + ' адресов; без команд и паролей…')
-        threading.Thread(target=self.scan_worker, args=(addresses,), daemon=True).start()
+        self.scan_control = OperationControl(parent=self.shutdown, reason='Поиск остановлен')
+        self.cancel_scan_button.pack(anchor='w', pady=(6, 0))
+        self.cancel_scan_button.state(['!disabled'])
+        self.summary.set(f'Поиск SSH: 0 из {len(addresses)}. Большая подсеть может проверяться долго.')
+        threading.Thread(target=self.scan_worker, args=(addresses, self.scan_control), daemon=True).start()
 
-    def scan_range(self):
-        value = simpledialog.askstring('Найти компьютеры', 'IP, диапазон, подсеть или список через запятую. До 512 адресов.\nПример: 172.22.42.1-172.22.42.32, 172.22.87.55', parent=self.window)
-        if value is None:
-            return
+    def cancel_scan(self):
+        if self.scan_control:
+            self.cancel_scan_button.state(['disabled'])
+            self.scan_control.cancel()
+            self.summary.set('Остановка поиска…')
+
+    def scan_worker(self, addresses, control):
+        rows = []
+        total, checked = len(addresses), 0
+        last_update = 0
         try:
-            addresses = parse_addresses(value)
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                remaining = iter(addresses)
+                pending = set()
+
+                def submit_next():
+                    address = next(remaining, None)
+                    if address is not None:
+                        pending.add(pool.submit(probe_address, address, control=control))
+
+                # Keep only a small queue of live requests even on an entire /16 or /8.
+                for _ in range(min(32, total)):
+                    submit_next()
+                while pending:
+                    control.check()
+                    done, pending = wait(pending, timeout=.2, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        row = future.result()
+                        checked += 1
+                        if row['ok']:
+                            rows.append(row)
+                        submit_next()
+                    now = time.monotonic()
+                    if checked == total or now - last_update >= .3:
+                        self.events.put(('scan_progress', f'Поиск SSH: {checked} из {total}. Найдено: {len(rows)}.'))
+                        last_update = now
+                control.check()
+        except OperationCancelled:
+            self.events.put(('local_scan_finished', ([], 'Поиск остановлен.')))
         except Exception as error:
-            messagebox.showerror('Диапазон IP', str(error), parent=self.window)
+            self.events.put(('local_scan_finished', ([], f'Ошибка поиска: {error}')))
+        else:
+            self.events.put(('local_scan_finished', (rows, '')))
+
+    def finish_local_scan(self, rows, status):
+        if self.scan_control and self.scan_control.cancelled.is_set():
+            status = 'Поиск остановлен.'
+        self.scan_control = None
+        self.cancel_scan_button.pack_forget()
+        self.set_busy(False)
+        if status:
+            self.summary.set(status)
             return
-        self.start_scan(addresses)
-
-    def scan_worker(self, addresses):
-        try:
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                control = getattr(self, 'shutdown', None)
-                options = dict(control=control) if control else {}
-                pending = [pool.submit(probe_address, ip, **options) for ip in addresses]
-                rows = []
-                for future in as_completed(pending):
-                    if control:
-                        control.check()
-                    rows.append(future.result())
-                    self.events.put(('scan_progress', 'Поиск SSH: проверено ' + str(len(rows)) + ' из ' + str(len(addresses))))
-            self.events.put(('range_found', [row for row in rows if row['ok']]))
-        except Exception as error:
-            self.events.put(('error', str(error)))
-
-    def range_found(self, rows):
         if not rows:
-            self.set_busy(False)
             self.summary.set('В диапазоне доступных SSH-серверов не найдено.')
+            messagebox.showinfo('Поиск компьютеров', 'В диапазоне доступных SSH-серверов не найдено.', parent=self.window)
             return
+        self.summary.set(f'Найдено адресов с доступным SSH: {len(rows)}.')
+        dialog = tk.Toplevel(self.window)
+        dialog.title('Найденные адреса')
+        dialog.transient(self.window)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text=f'Найдено адресов с SSH: {len(rows)}. Выберите ПК для проверки имени и версии Astra.').pack(anchor='w')
+        listing = ttk.Treeview(frame, columns=('ip', 'key'), show='headings', selectmode='extended', height=10)
+        listing.heading('ip', text='IP')
+        listing.heading('key', text='Отпечаток SSH')
+        listing.column('ip', width=130)
+        listing.column('key', width=390)
+        listing.pack(side='left', fill='both', expand=True, pady=6)
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=listing.yview)
+        scroll.pack(side='left', fill='y', pady=6)
+        listing.configure(yscrollcommand=scroll.set)
+        from ipaddress import IPv4Address
+        by_ip = {row['ip']: row for row in rows}
+        for ip in sorted(by_ip, key=IPv4Address):
+            listing.insert('', 'end', iid=ip, values=(ip, by_ip[ip]['fingerprint']))
+
+        def verify():
+            selected = [by_ip[ip] for ip in listing.selection()]
+            if not selected:
+                messagebox.showinfo('Выберите ПК', 'Выберите строки для проверки. Shift выделяет несколько строк.',
+                                    parent=dialog)
+                return
+            dialog.destroy()
+            self.verify_discovered(selected)
+
+        bar = ttk.Frame(dialog, padding=(14, 0, 14, 12))
+        bar.pack(fill='x')
+        ttk.Button(bar, text='Выбрать все', command=lambda: listing.selection_set(listing.get_children())).pack(side='left')
+        ttk.Button(bar, text='Проверить и добавить…', command=verify).pack(side='left', padx=8)
+        ttk.Button(bar, text='Закрыть', command=dialog.destroy).pack(side='right')
+        cm_ui.color_widgets(dialog, self.palette)
+        dialog.grab_set()
+        self.window.wait_window(dialog)
+
+    def verify_discovered(self, rows):
+        self.set_busy(True)
         known = list(self.catalog.values()) + list(self.trusted.values())
         unknown = [row for row in rows if not any(same_key(row, value) for value in known)]
         if unknown:
@@ -1330,41 +1449,49 @@ class Manager:
         for row in candidates:
             tree.insert('', 'end', iid=row['name'], values=('☐', row['name'], row['ip'], 'DNS / DHCP' if row['mode'] == 'dns' else 'Постоянный IP (DNS не подтверждён)'))
         tree.pack(fill='both', expand=True)
+        anchor = None
+
         def toggle(event):
+            nonlocal anchor
             name = tree.identify_row(event.y)
-            if name:
-                if name in selected:
-                    selected.remove(name)
-                else:
-                    selected.add(name)
-                values = list(tree.item(name, 'values'))
-                values[0] = '☑' if name in selected else '☐'
-                tree.item(name, values=values)
+            if not name:
+                return
+            if event.state & 0x0001 and anchor is not None:
+                order = tree.get_children()
+                low, high = sorted((order.index(anchor), order.index(name)))
+                selection = order[low:high + 1]
+                selected.update(selection)
+            else:
+                anchor = name
+                selection = (name,)
+                selected.symmetric_difference_update(selection)
+            for item in selection:
+                values = list(tree.item(item, 'values'))
+                values[0] = '☑' if item in selected else '☐'
+                tree.item(item, values=values)
         tree.bind('<Button-1>', toggle)
-        ttk.Label(frame, text='Выбранные записи добавятся в класс; существующие записи с тем же именем обновятся.').pack(anchor='w', pady=8)
+        ttk.Label(frame, text='Новые ПК появятся во «Все компьютеры». При желании выберите кабинет.').pack(anchor='w', pady=8)
         ttk.Label(frame, text='Кабинет назначения:').pack(anchor='w')
-        rooms = sorted(self.rooms) or ['Найденные']
-        destination = tk.StringVar(value=self.room.get() if self.room.get() in rooms else rooms[0])
-        ttk.Combobox(frame, textvariable=destination, values=rooms, state='readonly', width=40).pack(anchor='w', pady=5)
+        destination = ttk.Combobox(frame, values=[ALL_COMPUTERS_LABEL] + sorted(self.rooms), state='readonly', width=40)
+        destination.current(0)
+        destination.pack(anchor='w', pady=5)
         def add():
             if not selected:
                 return
             try:
+                room = '' if destination.current() == 0 else destination.get()
                 hosts = [host for host in self.hosts if host.name not in selected]
                 new_trust = dict(self.trusted)
                 for row in candidates:
                     if row['name'] in selected:
                         old = next((h for h in self.hosts if h.name == row['name']), None)
-                        hosts.append(replace(old, ip=row['ip'], room=destination.get(), mode='fixed' if self.domain else row['mode']) if old else Host(row['name'], row['ip'], destination.get(), 'fixed' if self.domain else row['mode'], row.get('username', 'user'), 'host', self.domain))
+                        hosts.append(replace(old, ip=row['ip'], room=room or old.room, mode='fixed' if self.domain else row['mode']) if old else Host(row['name'], row['ip'], room, 'fixed' if self.domain else row['mode'], row.get('username', 'user'), 'host', self.domain))
                         new_trust[row['name']] = {key: row[key] for key in ('type', 'key', 'fingerprint', 'name')}
-                new_rooms = list(self.rooms)
-                if destination.get() not in new_rooms:
-                    new_rooms.append(destination.get())
-                save_inventory(self.inventory_file, new_rooms, hosts, domain=self.domain)
+                save_inventory(self.inventory_file, self.rooms, hosts, domain=self.domain)
                 atomic_json(self.trust_file, new_trust)
-                self.hosts, self.rooms, self.trusted = hosts, new_rooms, new_trust
-                self.selected.clear()
-                self.refresh()
+                self.hosts, self.trusted = hosts, new_trust
+                self.room.set(room or ALL_COMPUTERS)
+                self.change_room()
                 self.summary.set('Добавлено/обновлено записей: ' + str(len(selected)))
                 dialog.destroy()
             except Exception as error:
@@ -1952,9 +2079,9 @@ class Manager:
                         self.refresh()
                 show_progress()
         elif kind == 'local_networks':
-            self.choose_local_network(value)
-        elif kind == 'range_found':
-            self.range_found(value)
+            self.choose_local_network(*value)
+        elif kind == 'local_scan_finished':
+            self.finish_local_scan(*value)
         elif kind == 'range_inspected':
             self.range_results(value)
         elif kind == 'overwrite':

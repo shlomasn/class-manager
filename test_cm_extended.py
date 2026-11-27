@@ -1566,38 +1566,31 @@ class AutomaticNetworkTests(unittest.TestCase):
                  row('wlan0',[],'192.168.2.4',24),row('down',['UP'],'10.1.1.1',24,'DOWN'),row('bad',['UP'],'10.1.1.1',2)]
         self.assertEqual(core.local_network_rows(payload,'linux'),[dict(interface='enp1s0',ip='172.20.4.8',network='172.20.4.0/23')])
 
-    def test_large_subnet_part_defaults_to_teacher_block_without_silent_full_scan(self):
-        row=dict(interface='LAN',ip='10.30.42.11',network='10.30.0.0/16')
-        plan=core.automatic_scan_plan(row)
-        self.assertEqual((plan['network'],plan['part'],plan['parts'],plan['partial']),('10.30.42.0/24',43,256,True))
-        self.assertEqual(len(plan['addresses']),255)
-        self.assertNotIn(row['ip'],plan['addresses'])
-        self.assertEqual(core.automatic_scan_plan(row,1)['network'],'10.30.0.0/24')
-        self.assertEqual(core.automatic_scan_plan(row,256)['network'],'10.30.255.0/24')
-        for part in (0,257,'1'):
-            with self.assertRaises(ValueError): core.automatic_scan_plan(row,part)
+    def test_large_subnet_plan_includes_every_block_except_teacher_and_network_edges(self):
+        row = dict(interface='LAN', ip='10.30.42.11', network='10.30.0.0/16')
+        plan = core.automatic_scan_plan(row, exclude=['10.30.240.3'])
+        self.assertEqual(plan['network'], '10.30.0.0/16')
+        self.assertEqual(len(plan['addresses']), 65532)
+        addresses = set(plan['addresses'])
+        self.assertTrue({'10.30.0.1', '10.30.87.0', '10.30.201.255', '10.30.255.254'} <= addresses)
+        self.assertFalse({'10.30.0.0', '10.30.255.255', row['ip'], '10.30.240.3'} & addresses)
 
-    def test_large_subnet_selects_another_block_by_address(self):
-        row = dict(interface='LAN', ip='172.22.22.10', network='172.22.0.0/16')
-        plan = core.automatic_scan_plan(row, target_ip='172.22.201.51')
-        self.assertEqual(plan['network'], '172.22.201.0/24')
-        self.assertEqual(len(plan['addresses']), 256)
-        self.assertEqual(plan['addresses'][0], '172.22.201.0')
-        self.assertEqual(plan['addresses'][-1], '172.22.201.255')
-        self.assertNotIn(row['ip'], plan['addresses'])
-        self.assertNotIn('172.22.0.0', core.automatic_scan_plan(row, target_ip='172.22.0.1')['addresses'])
-        self.assertNotIn('172.22.255.255', core.automatic_scan_plan(row, target_ip='172.22.255.1')['addresses'])
-        with self.assertRaisesRegex(ValueError, 'из выбранной сети'):
-            core.automatic_scan_plan(row, target_ip='172.23.1.10')
+    def test_manual_scan_combines_ranges_without_expanding_them(self):
+        targets = core.scan_targets('172.22.0.1 - 172.22.3.255, 172.22.0.5, 172.22.4.10',
+                                    exclude=['172.22.0.2'])
+        self.assertEqual(len(targets), 1023)
+        self.assertEqual(next(iter(targets)), '172.22.0.1')
+        self.assertIn('172.22.4.10', targets)
+        with self.assertRaises(ValueError):
+            core.scan_targets('10.1.1.2-172.22.1.2')
 
     def test_small_subnet_scans_whole_network_and_excludes_all_teacher_addresses(self):
-        row=dict(interface='LAN',ip='192.168.4.5',network='192.168.4.0/23')
-        plan=core.automatic_scan_plan(row,exclude=['192.168.4.6'])
-        self.assertFalse(plan['partial'])
-        self.assertEqual(len(plan['addresses']),508)
-        self.assertNotIn('192.168.4.6',plan['addresses'])
-        plan=core.automatic_scan_plan(dict(interface='LAN',ip='10.1.1.1',network='10.1.1.1/32'))
-        self.assertEqual(plan['addresses'],[])
+        row = dict(interface='LAN', ip='192.168.4.5', network='192.168.4.0/23')
+        plan = core.automatic_scan_plan(row, exclude=['192.168.4.6'])
+        self.assertEqual(len(plan['addresses']), 508)
+        self.assertNotIn('192.168.4.6', plan['addresses'])
+        plan = core.automatic_scan_plan(dict(interface='LAN', ip='10.1.1.1', network='10.1.1.1/32'))
+        self.assertEqual(list(plan['addresses']), [])
 
     def test_windows_detection_uses_connected_interfaces_without_shell_or_passwords(self):
         import subprocess,shutil

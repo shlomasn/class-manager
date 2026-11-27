@@ -275,7 +275,7 @@ class NewFeaturesTests(unittest.TestCase):
         self.assertIn('shutdown -r now ', core.power_command('reboot', 0))
         self.assertTrue(core.power_command('cancel', 0).endswith('shutdown -c'))
 
-    def test_removing_room_deletes_only_its_records(self):
+    def test_removing_room_keeps_computers_unassigned(self):
         app = InterfaceTests().app()
         with tempfile.TemporaryDirectory() as directory:
             app.inventory_file = Path(directory) / 'inventory.json'
@@ -285,7 +285,7 @@ class NewFeaturesTests(unittest.TestCase):
             with patch.object(gui.messagebox, 'askyesno', return_value=True), patch.object(gui, 'execute') as execute:
                 app.remove_room()
             self.assertEqual(app.rooms, ['702'])
-            self.assertEqual([host.name for host in app.hosts], ['a702-06'])
+            self.assertEqual([(host.name, host.room) for host in app.hosts], [('a701-02', ''), ('a702-06', '702')])
             self.assertEqual(core.load_inventory(app.inventory_file), (app.rooms, app.hosts))
             execute.assert_not_called()
 

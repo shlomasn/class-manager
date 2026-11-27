@@ -190,7 +190,8 @@ def validate_hosts(rows):
         interface = row.get('mac_interface', '')
         if kind not in ('', 'manual', 'ethernet', 'wifi') or not isinstance(interface, str) or len(interface) > 64 or any(ord(c) < 32 for c in interface):
             raise ValueError('Некорректный тип или имя MAC-адаптера')
-        result.append(Host(name, ip, room_name(row.get('room', default_room)), mode, login, credentials, dns_domain(row.get('domain', '')),
+        room = row.get('room', default_room)
+        result.append(Host(name, ip, room_name(room) if room != '' else '', mode, login, credentials, dns_domain(row.get('domain', '')),
                            mac_address(row['mac']) if row.get('mac') else '',
                            school_ip(row['wol_broadcast']) if row.get('wol_broadcast') else '', kind, interface))
     return result
@@ -236,7 +237,7 @@ def load_profile_inventory(path, default_domain=None, legacy_network=None):
     for row in rows:
         row.setdefault('domain', domain or '')  # Legacy entries can use the profile's configured domain.
     hosts = validate_hosts(rows)
-    if any(host.room not in rooms for host in hosts):
+    if any(host.room and host.room not in rooms for host in hosts):
         raise ValueError('Компьютер ссылается на отсутствующий класс')
     return rooms, hosts, domain if domain is not None else (hosts[0].domain if hosts else '')
 
@@ -248,7 +249,7 @@ def save_inventory(path, rooms, hosts, *, domain=None):
     # Validate before replacing a valid configuration.
     validated = validate_hosts(payload['hosts'])
     clean_rooms = [room_name(value) for value in rooms]
-    if len(clean_rooms) != len(set(clean_rooms)) or len(clean_rooms) > 100 or any(h.room not in clean_rooms for h in validated):
+    if len(clean_rooms) != len(set(clean_rooms)) or len(clean_rooms) > 100 or any(h.room and h.room not in clean_rooms for h in validated):
         raise ValueError('Некорректный список классов')
     atomic_json(path, payload)
 
@@ -892,31 +893,61 @@ def transfer_files(host, pin, password, paths, batch, destination=None, progress
     return result
 
 
-def parse_addresses(text, limit=512):
-    """Comma/newline-separated IPv4, full ranges, or CIDR; bounded before enumeration."""
-    addresses = set()
-    tokens = [x for x in re.split(r'[,;\s]+', text.strip()) if x]
-    if not tokens:
-        raise ValueError('Укажите IP, диапазон или подсеть')
-    for token in tokens:
+PRIVATE_NETWORKS = tuple(map(ipaddress.IPv4Network, ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')))
+
+
+class ScanTargets:
+    """Merged IPv4 ranges, iterable without allocating a string for every address."""
+    def __init__(self, spans, exclude):
+        merged = []
+        for first, last in sorted(spans):
+            if merged and first <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], last))
+            else:
+                merged.append((first, last))
+        self.spans = merged
+        self.excluded = {int(ipaddress.IPv4Address(ip)) for ip in exclude}
+        self.count = sum(last - first + 1 for first, last in merged)
+        self.count -= sum(any(first <= ip <= last for first, last in merged) for ip in self.excluded)
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        for first, last in self.spans:
+            for ip in range(first, last + 1):
+                if ip not in self.excluded:
+                    yield str(ipaddress.IPv4Address(ip))
+
+
+def scan_targets(text, exclude=()):
+    spans = []
+    text = re.sub(r'\s*-\s*', '-', text)
+    for token in filter(None, re.split(r'[,;\s]+', text.strip())):
         if '/' in token:
             network = ipaddress.IPv4Network(token, strict=False)
-            if not any(network.subnet_of(ipaddress.ip_network(private)) for private in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')) or network.num_addresses > limit + 2:
-                raise ValueError('Диапазон вне школьной сети или более ' + str(limit) + ' адресов')
-            values = network.hosts()
-        elif '-' in token:
-            first, last = token.split('-', 1)
-            start, end = int(ipaddress.IPv4Address(school_ip(first))), int(ipaddress.IPv4Address(school_ip(last)))
-            if start > end or end - start + 1 > limit:
-                raise ValueError('Некорректный или слишком большой диапазон')
-            values = (ipaddress.IPv4Address(n) for n in range(start, end + 1))
+            offset = int(network.prefixlen < 31)
+            first = int(network.network_address) + offset
+            last = int(network.broadcast_address) - offset
+            check_first, check_last = network.network_address, network.broadcast_address
         else:
-            values = [ipaddress.IPv4Address(school_ip(token))]
-        for value in values:
-            addresses.add(school_ip(str(value)))
-            if len(addresses) > limit:
-                raise ValueError('За раз допускается до ' + str(limit) + ' адресов')
-    return sorted(addresses, key=lambda value: int(ipaddress.IPv4Address(value)))
+            first_ip, _, last_ip = token.partition('-')
+            check_first = ipaddress.IPv4Address(first_ip)
+            check_last = ipaddress.IPv4Address(last_ip if '-' in token else first_ip)
+            first, last = int(check_first), int(check_last)
+        if first > last or not any(check_first in net and check_last in net for net in PRIVATE_NETWORKS):
+            raise ValueError('Укажите диапазон внутри локальной сети IPv4 (10.*, 172.16–31.*, 192.168.*).')
+        spans.append((first, last))
+    if not spans:
+        raise ValueError('Укажите IP, диапазон или подсеть.')
+    return ScanTargets(spans, exclude)
+
+
+def parse_addresses(text, limit=512):
+    addresses = scan_targets(text)
+    if len(addresses) > limit:
+        raise ValueError(f'За раз допускается до {limit} адресов')
+    return list(addresses)
 
 
 def local_network_rows(payload, platform):
@@ -983,27 +1014,9 @@ def detect_local_networks():
         raise RuntimeError('Не удалось прочитать локальные сети. Используйте ручной диапазон IP.') from None
 
 
-def automatic_scan_plan(row, part=None, exclude=(), *, target_ip=None):
-    network = ipaddress.IPv4Network(row['network'])
-    # A large real subnet is explicitly divided into /24 blocks.
-    parts = 2 ** (24 - network.prefixlen) if network.prefixlen < 23 else 1
-    target = ipaddress.IPv4Address(target_ip if target_ip is not None else row['ip'])
-    if target not in network:
-        raise ValueError(f'Введите IP из выбранной сети {network}')
-    default = (int(target) - int(network.network_address)) // 256 + 1 if parts > 1 else 1
-    part = default if part is None else part
-    if type(part) is not int or not 1 <= part <= parts:
-        raise ValueError('Выберите допустимый номер части сети')
-    selected = ipaddress.IPv4Network((int(network.network_address) + (part - 1) * 256, 24)) if parts > 1 else network
-    excluded = set(exclude) | {row['ip']}
-    if parts > 1:
-        # The /24 is just a search window. Its .0 and .255 may be valid in the real subnet.
-        candidates = (ip for ip in selected
-                      if ip != network.network_address and ip != network.broadcast_address)
-        addresses = [school_ip(str(ip)) for ip in candidates if str(ip) not in excluded]
-    else:
-        addresses = [ip for ip in parse_addresses(str(selected)) if ip not in excluded]
-    return dict(network=str(selected), addresses=addresses, parts=parts, part=part, partial=parts > 1)
+def automatic_scan_plan(row, exclude=()):
+    network = row['network']
+    return dict(network=network, addresses=scan_targets(network, set(exclude) | {row['ip']}))
 
 
 def probe_address(ip, control=None):
