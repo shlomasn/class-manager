@@ -8,6 +8,8 @@ from pathlib import Path
 import queue
 import re
 import posixpath
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -199,6 +201,8 @@ class Manager:
         self.menu_action(menu, 'Сохранить / изменить общий пароль user…', self.save_password)
         self.menu_action(menu, 'Удалить общий пароль user…', self.forget_password)
         menu.add_separator()
+        if sys.platform.startswith('linux'):
+            self.menu_action(menu, 'Создать ярлык запуска CM…', self.create_launch_shortcut)
         self.menu_action(menu, 'Результаты последней операции', self.show_results)
         self.credential_status = tk.StringVar(value='Пароль хранится в системном хранилище')
         ttk.Label(sidebar, textvariable=self.credential_status, style='Side.TLabel', wraplength=150).grid(row=4, column=0, sticky='w')
@@ -872,6 +876,19 @@ class Manager:
             self.refresh()
         except Exception as error:
             messagebox.showerror('Компьютеры не удалены', str(error), parent=self.window)
+
+    def create_launch_shortcut(self):
+        title = 'Ярлык запуска CM'
+        try:
+            result = subprocess.run([sys.executable, '-B', str(ROOT / 'Start-CM.pyw'), '--create-shortcut'],
+                                    capture_output=True, encoding='utf-8', errors='replace', timeout=10)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or 'Не удалось создать ярлык.')
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            messagebox.showerror(title, str(error), parent=self.window)
+            return
+        messagebox.showinfo(title, 'Ярлык создан. В следующий раз откройте «CM Astra» из меню приложений. '
+                                   'Он запускает CM без терминала.', parent=self.window)
 
     def save_password(self):
         password = simpledialog.askstring('Сохранить пароль', 'Пароль локального user на школьных ПК:\nБудет сохранён в системном хранилище текущего пользователя.', show='*', parent=self.window)
