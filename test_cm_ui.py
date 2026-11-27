@@ -230,10 +230,10 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_all_inventory_password_and_power_actions_stay_available_in_menus(self):
         labels = {menu.entrycget(index, 'label'): (menu, index, inventory) for menu, index, inventory in self.app.menu_controls}
-        expected = ['Добавить ПК…', 'Изменить выбранную строку…', 'Удалить отмеченные ПК…',
-                    'Перенести отмеченные в кабинет…', 'Импорт списка .csv / .lst / .json…', 'Найти ПК…',
-                    'Добавить кабинет…', 'Удалить текущий кабинет…', 'Сохранить / изменить пароль…',
-                    'Забыть сохранённый пароль', 'Выключить…', 'Перезагрузить…',
+        expected = ['Добавить ПК…', 'Изменить выбранный ПК', 'Удалить отмеченные ПК…',
+                    'Перенести отмеченные в кабинет…', 'Получить MAC выбранных ПК…',
+                    'Добавить кабинет…', 'Удалить текущий кабинет…', 'Сохранить / изменить общий пароль user…',
+                    'Удалить общий пароль user…', 'Выключить…', 'Перезагрузить…',
                     'Отменить запланированное выключение / перезагрузку…',
                     'Отменить раздачу выбранным', 'Остановить команды выбранным…']
         self.assertTrue(set(expected).issubset(labels))
@@ -440,7 +440,7 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(set(prepare.call_args.args[0]['targets']), {first, second})
         execute.assert_not_called()
 
-    def test_add_pc_button_opens_chooser_with_room_and_dispatches_search(self):
+    def test_add_pc_menu_opens_chooser_with_room_and_dispatches_search(self):
         app = self.app
         app.room.set(app.rooms[0])
         labels = []
@@ -457,9 +457,15 @@ class WorkbenchTests(unittest.TestCase):
                  and w.cget('text') == 'Найти ПК…').invoke()
 
         self.root.after(50, choose)
+        menu, index, _ = next((menu, index, flag) for menu, index, flag in app.menu_controls
+                              if menu.entrycget(index, 'label') == 'Добавить ПК…')
+        menu_labels = [menu.entrycget(i, 'label') for i in range(menu.index('end') + 1)]
+        self.assertNotIn('Найти ПК…', menu_labels)
+        self.assertNotIn('Импорт списка .csv / .lst / .json…', menu_labels)
+        self.assertNotIn('Добавить ПК…', [w.cget('text') for w in app.controls])
         with patch.object(app, 'scan_local_network') as search:
-            app.add_pc_button.invoke()
-        self.assertIn(f'Кабинет по умолчанию: {app.rooms[0]}', labels)
+            menu.invoke(index)
+        self.assertIn(f'Кабинет при ручном вводе: {app.rooms[0]}', labels)
         self.assertTrue({'Добавить вручную…', 'Найти ПК…', 'Импортировать список…'}.issubset(labels))
         search.assert_called_once_with()
 

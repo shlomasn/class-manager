@@ -180,9 +180,10 @@ class Manager:
         sidebar.bind('<Configure>', self.fit_sidebar, add='+')
         computers = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Компьютеры', menu=computers)
-        for text, command in [('Добавить ПК…', self.add_host), ('Изменить выбранную строку…', self.edit_host),
-                              ('Удалить отмеченные ПК…', self.remove_hosts), ('Перенести отмеченные в кабинет…', self.move_hosts),
-                              ('Импорт списка .csv / .lst / .json…', self.import_list), ('Получить MAC выбранных ПК…', lambda: self.begin('collect_mac')), ('Найти ПК…', self.scan_local_network)]:
+        for text, command in [('Добавить ПК…', self.add_pc_dialog), ('Изменить выбранный ПК', self.edit_host),
+                              ('Удалить отмеченные ПК…', self.remove_hosts),
+                              ('Перенести отмеченные в кабинет…', self.move_hosts),
+                              ('Получить MAC выбранных ПК…', lambda: self.begin('collect_mac'))]:
             self.menu_action(computers, text, command, inventory=True)
         rooms = tk.Menu(menu, tearoff=False)
         menu.add_cascade(label='Кабинеты', menu=rooms)
@@ -195,8 +196,8 @@ class Manager:
         self.menu_action(profile, 'Сохранить копию…', self.export_profile, inventory=True)
         self.menu_action(profile, 'Восстановить из копии…', self.restore_profile, inventory=True)
         self.menu_action(menu, 'Домен для имён ПК…', self.network_settings, inventory=True)
-        self.menu_action(menu, 'Сохранить / изменить пароль…', self.save_password)
-        self.menu_action(menu, 'Забыть сохранённый пароль', self.forget_password)
+        self.menu_action(menu, 'Сохранить / изменить общий пароль user…', self.save_password)
+        self.menu_action(menu, 'Удалить общий пароль user…', self.forget_password)
         menu.add_separator()
         self.menu_action(menu, 'Результаты последней операции', self.show_results)
         self.credential_status = tk.StringVar(value='Пароль хранится в системном хранилище')
@@ -217,15 +218,11 @@ class Manager:
         self.room_title = tk.StringVar(value=ALL_COMPUTERS_LABEL)
         header.grid_columnconfigure(0, weight=1)
         ttk.Label(header, textvariable=self.room_title, style='Title.TLabel').grid(row=0, column=0, sticky='ew', padx=(0, 12))
-        self.add_pc_button = ttk.Button(header, text='Добавить ПК…', command=self.add_pc_dialog)
-        self.add_pc_button.grid(row=0, column=1, sticky='e', padx=(0, 8))
-        self.controls.append(self.add_pc_button)
-        self.inventory_controls.append(self.add_pc_button)
         check = ttk.Button(header, text='Проверить связь', command=lambda: self.begin('scan'))
-        check.grid(row=0, column=2, sticky='e')
+        check.grid(row=0, column=1, sticky='e')
         self.controls.append(check)
         self.time_sync_button = ttk.Button(header, text='Синхронизировать время', command=self.sync_time_dialog)
-        self.time_sync_button.grid(row=0, column=3, sticky='e', padx=(8, 0))
+        self.time_sync_button.grid(row=0, column=2, sticky='e', padx=(8, 0))
         self.controls.append(self.time_sync_button)
         self.overview = tk.StringVar(value='Компьютеры учеников')
         ttk.Label(main, textvariable=self.overview, style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 12))
@@ -720,16 +717,18 @@ class Manager:
 
     def add_pc_dialog(self):
         dialog = tk.Toplevel(self.window)
-        dialog.title('Добавить компьютеры')
+        dialog.title('Добавить ПК')
         dialog.transient(self.window)
-        frame = ttk.Frame(dialog, padding=18)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=(20, 16))
         frame.pack(fill='both', expand=True)
+        frame.columnconfigure(0, weight=1)
         destination = tk.StringVar()
 
         def update_destination():
             room = self.room.get()
-            destination.set(f'Кабинет по умолчанию: {room}' if room in self.rooms else
-                            'Новые ПК появятся в списке «Все компьютеры». Кабинет можно выбрать позже.')
+            destination.set(f'Кабинет при ручном вводе: {room}' if room in self.rooms else
+                            'Ручной ввод откроется с выбором «Без кабинета».')
 
         def create_room():
             dialog.grab_release()
@@ -743,18 +742,27 @@ class Manager:
             dialog.destroy()
             action()
 
-        ttk.Label(frame, textvariable=destination, wraplength=490).grid(row=0, columnspan=2, sticky='w')
-        ttk.Button(frame, text='Создать кабинет…', command=create_room).grid(row=1, column=0, sticky='w', pady=(6, 12))
+        ttk.Label(frame, text='Выберите способ добавления', style='Section.TLabel').grid(
+            row=0, column=0, sticky='w', pady=(0, 10))
         options = [
-            ('Добавить вручную…', 'Известно имя или адрес одного компьютера.', self.add_host),
-            ('Найти ПК…', 'Вся локальная подсеть или указанный диапазон IP.', self.scan_local_network),
-            ('Импортировать список…', 'Кабинеты и ПК уже записаны в CSV, LST или JSON.', self.import_list),
+            ('Один компьютер', 'Если знаете имя или IP компьютера.', 'Добавить вручную…', self.add_host),
+            ('Поиск компьютеров', 'Вся подсеть учителя или указанный диапазон IP.', 'Найти ПК…', self.scan_local_network),
+            ('Готовый список', 'Для файла с ПК и кабинетами в CSV, LST или JSON.', 'Импортировать список…', self.import_list),
         ]
-        for row, (label, hint, action) in enumerate(options, start=2):
+        for index, (title, hint, label, action) in enumerate(options):
+            row = 1 + index * 3
+            ttk.Separator(frame).grid(row=row, column=0, columnspan=2, sticky='ew', pady=(5, 7))
+            ttk.Label(frame, text=title, style='Section.TLabel').grid(row=row+1, column=0, sticky='w', padx=(0, 20))
+            ttk.Label(frame, text=hint, style='Muted.TLabel', wraplength=285).grid(
+                row=row+2, column=0, sticky='nw', padx=(0, 20), pady=(3, 5))
             ttk.Button(frame, text=label, command=lambda action=action: open_step(action)).grid(
-                row=row, column=0, sticky='ew', pady=4, padx=(0, 12))
-            ttk.Label(frame, text=hint, wraplength=305).grid(row=row, column=1, sticky='w')
-        ttk.Button(frame, text='Закрыть', command=dialog.destroy).grid(row=6, column=1, sticky='e', pady=(12, 0))
+                row=row+1, column=1, rowspan=2, sticky='ew', pady=4)
+        ttk.Separator(frame).grid(row=10, column=0, columnspan=2, sticky='ew', pady=(8, 10))
+        ttk.Label(frame, textvariable=destination, style='Muted.TLabel', wraplength=480).grid(
+            row=11, column=0, columnspan=2, sticky='w', pady=(0, 8))
+        ttk.Button(frame, text='Создать кабинет…', command=create_room).grid(row=12, column=0, sticky='w')
+        ttk.Button(frame, text='Закрыть', command=dialog.destroy).grid(row=12, column=1, sticky='e')
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
         update_destination()
         cm_ui.color_widgets(dialog, self.palette)
         dialog.grab_set()
@@ -814,7 +822,7 @@ class Manager:
         mode_changed()
         ttk.Label(frame, text='MAC и адрес WoL можно заполнить позже командой «Получить MAC выбранных ПК…».\nMAC-адаптер: ' + ((original.mac_interface or 'не указан') + ' · ' + {'wifi': 'Wi-Fi (включение не гарантируется)', 'ethernet': 'Ethernet', 'manual': 'введён вручную', '': 'тип не определён'}.get(original.mac_type, '') if original else 'не определён')).grid(row=9, columnspan=2, sticky='w', pady=12)
         ttk.Checkbutton(frame, text='Удалить индивидуальный сохранённый пароль', variable=erase).grid(row=10, columnspan=2, sticky='w')
-        ttk.Label(frame, text='Пустой пароль сохраняет прежний. Новый пароль хранится только\nв системном хранилище; для другого логина выберите «Для этого ПК».').grid(row=11, columnspan=2, sticky='w', pady=8)
+        ttk.Label(frame, text='Для отдельного логина выберите «Для этого ПК». Введите пароль,\nчтобы его сохранить, или отметьте удаление и нажмите «Сохранить».\nПустое поле оставляет прежний пароль для этого ПК и логина.').grid(row=11, columnspan=2, sticky='w', pady=8)
         def save():
             try:
                 dns = mode.get().startswith('По имени')
@@ -889,7 +897,7 @@ class Manager:
         if password:
             self.credential_status.set('Используется пароль из системного хранилища')
             return password
-        return simpledialog.askstring('Пароль администратора', 'Общий пароль локального user на выбранных ПК:\nДля сохранения используйте кнопку «Сохранить / изменить пароль».', show='*', parent=self.window)
+        return simpledialog.askstring('Пароль администратора', 'Общий пароль локального user на выбранных ПК:\nДля сохранения используйте пункт «Сохранить / изменить общий пароль user…».', show='*', parent=self.window)
 
     def get_host_passwords(self, hosts):
         if all(host.credential_mode == 'shared' for host in hosts):
@@ -922,7 +930,7 @@ class Manager:
             messagebox.showinfo('Выберите ПК', 'Отметьте компьютеры для переноса в класс.', parent=self.window)
             return
         if not self.rooms:
-            messagebox.showinfo('Создайте кабинет', 'Сначала добавьте кабинет через «Добавить ПК…».', parent=self.window)
+            messagebox.showinfo('Создайте кабинет', 'Сначала добавьте кабинет через «Управление и настройки → Кабинеты».', parent=self.window)
             return
         dialog = tk.Toplevel(self.window)
         dialog.title('Перенести компьютеры в класс')
