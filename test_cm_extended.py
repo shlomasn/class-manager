@@ -1570,12 +1570,25 @@ class AutomaticNetworkTests(unittest.TestCase):
         row=dict(interface='LAN',ip='10.30.42.11',network='10.30.0.0/16')
         plan=core.automatic_scan_plan(row)
         self.assertEqual((plan['network'],plan['part'],plan['parts'],plan['partial']),('10.30.42.0/24',43,256,True))
-        self.assertEqual(len(plan['addresses']),253)
+        self.assertEqual(len(plan['addresses']),255)
         self.assertNotIn(row['ip'],plan['addresses'])
         self.assertEqual(core.automatic_scan_plan(row,1)['network'],'10.30.0.0/24')
         self.assertEqual(core.automatic_scan_plan(row,256)['network'],'10.30.255.0/24')
         for part in (0,257,'1'):
             with self.assertRaises(ValueError): core.automatic_scan_plan(row,part)
+
+    def test_large_subnet_selects_another_block_by_address(self):
+        row = dict(interface='LAN', ip='172.22.22.10', network='172.22.0.0/16')
+        plan = core.automatic_scan_plan(row, target_ip='172.22.201.51')
+        self.assertEqual(plan['network'], '172.22.201.0/24')
+        self.assertEqual(len(plan['addresses']), 256)
+        self.assertEqual(plan['addresses'][0], '172.22.201.0')
+        self.assertEqual(plan['addresses'][-1], '172.22.201.255')
+        self.assertNotIn(row['ip'], plan['addresses'])
+        self.assertNotIn('172.22.0.0', core.automatic_scan_plan(row, target_ip='172.22.0.1')['addresses'])
+        self.assertNotIn('172.22.255.255', core.automatic_scan_plan(row, target_ip='172.22.255.1')['addresses'])
+        with self.assertRaisesRegex(ValueError, 'из выбранной сети'):
+            core.automatic_scan_plan(row, target_ip='172.23.1.10')
 
     def test_small_subnet_scans_whole_network_and_excludes_all_teacher_addresses(self):
         row=dict(interface='LAN',ip='192.168.4.5',network='192.168.4.0/23')

@@ -426,7 +426,7 @@ class WorkbenchTests(unittest.TestCase):
             app.choose_local_network(rows)
         start.assert_not_called()
 
-    def test_auto_network_dialog_selects_detected_scope_without_manual_input(self):
+    def test_auto_network_dialog_scans_another_block_inside_detected_subnet(self):
         app=self.app
         rows=[dict(interface='Wi-Fi',ip='10.20.30.10',network='10.20.0.0/16')]
         def start():
@@ -435,13 +435,18 @@ class WorkbenchTests(unittest.TestCase):
                 for w in parent.winfo_children():
                     yield w
                     yield from widgets(w)
+            target = next(w for w in widgets(dialog) if isinstance(w, ttk.Entry) and not isinstance(w, ttk.Combobox))
+            self.assertEqual(target.get(), '10.20.30.10')
+            target.delete(0, 'end')
+            target.insert(0, '10.20.87.55')
             next(w for w in widgets(dialog) if isinstance(w,ttk.Button) and w.cget('text')=='Найти компьютеры').invoke()
         self.root.after(50,start)
         with patch.object(app,'start_scan') as scan:
             app.choose_local_network(rows)
         ips=scan.call_args.args[0]
-        self.assertEqual(len(ips),253)
-        self.assertEqual(ips[0],'10.20.30.1')
+        self.assertEqual(len(ips),256)
+        self.assertEqual(ips[0],'10.20.87.0')
+        self.assertIn('10.20.87.55', ips)
         self.assertNotIn('10.20.30.10',ips)
 
 

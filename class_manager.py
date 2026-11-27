@@ -1074,27 +1074,38 @@ class Manager:
         choice.current(0)
         info = tk.StringVar()
         ttk.Label(frame, textvariable=info, wraplength=640).pack(anchor='w', pady=6)
-        part = tk.StringVar()
-        part_row = ttk.Frame(frame)
-        part_row.pack(fill='x', pady=6)
-        ttk.Label(part_row, text='Часть большой сети:').pack(side='left')
-        number = ttk.Spinbox(part_row, from_=1, to=1, textvariable=part, width=8)
-        number.pack(side='left', padx=8)
+        target_ip = tk.StringVar()
+        target_row = ttk.Frame(frame)
+        target_row.pack(fill='x', pady=6)
+        ttk.Label(target_row, text='IP из нужного кабинета:').pack(side='left')
+        target_entry = ttk.Entry(target_row, textvariable=target_ip, width=20)
+        target_entry.pack(side='left', padx=8)
         preview = tk.StringVar()
         ttk.Label(frame, textvariable=preview, wraplength=640).pack(anchor='w', pady=8)
         own_ips = {row['ip'] for row in rows}
+
+        def current_plan():
+            row = rows[choice.current()]
+            target = target_ip.get().strip() if target_entry.instate(['!disabled']) else None
+            return automatic_scan_plan(row, exclude=own_ips, target_ip=target)
+
         def show_plan(*args):
             try:
-                plan = automatic_scan_plan(rows[choice.current()], int(part.get()), own_ips)
-                preview.set('Будет проверено: ' + plan['network'] + ', адресов: ' + str(len(plan['addresses'])) + '. Компьютер учителя исключён.')
-            except (ValueError, IndexError):
-                preview.set('Выберите допустимый номер части сети.')
+                plan = current_plan()
+                preview.set(f"Диапазон поиска: {plan['network']}. Будет проверено адресов: {len(plan['addresses'])}.")
+            except ValueError:
+                preview.set(f"Введите IPv4 из сети {rows[choice.current()]['network']}.")
+
         def selected(event=None):
-            plan = automatic_scan_plan(rows[choice.current()], exclude=own_ips)
-            number.configure(to=plan['parts'], state='normal' if plan['partial'] else 'disabled')
-            info.set('Подсеть большая: будет проверена только выбранная часть /24. По умолчанию — часть с компьютером учителя. Для остальных частей меняйте номер и повторяйте поиск.' if plan['partial'] else 'Будет проверена вся выбранная подсеть (до 512 адресов).')
-            part.set(str(plan['part']))
-        part.trace_add('write', show_plan)
+            row = rows[choice.current()]
+            plan = automatic_scan_plan(row, exclude=own_ips)
+            target_entry.configure(state='normal' if plan['partial'] else 'disabled')
+            info.set('В большой сети CM проверяет один участок /24 за раз. По умолчанию это участок учителя. '
+                     'Для другого кабинета введите один IP из его участка. Этот ПК может быть выключен.'
+                     if plan['partial'] else 'Будет проверена вся выбранная подсеть.')
+            target_ip.set(row['ip'])
+
+        target_ip.trace_add('write', show_plan)
         choice.bind('<<ComboboxSelected>>', selected)
         selected()
         ttk.Label(frame, text='Поиск обнаруживает доступные SSH-серверы. Затем проверяются имя и Astra;\nвы сами выбираете, какие ПК добавить. Без SSH компьютер не появится в результатах.').pack(anchor='w', pady=8)
@@ -1102,11 +1113,11 @@ class Manager:
         bar.pack(fill='x', pady=8)
         def search():
             try:
-                plan = automatic_scan_plan(rows[choice.current()], int(part.get()), own_ips)
+                plan = current_plan()
                 if not plan['addresses']:
                     raise ValueError('В этой сети нет других адресов для поиска')
             except (ValueError, IndexError) as error:
-                messagebox.showerror('Локальная сеть', str(error), parent=dialog)
+                messagebox.showerror('Локальная сеть', f"Проверьте IP и выбранное подключение. {error}", parent=dialog)
                 return
             dialog.destroy()
             self.start_scan(plan['addresses'])
@@ -1122,7 +1133,7 @@ class Manager:
         threading.Thread(target=self.scan_worker, args=(addresses,), daemon=True).start()
 
     def scan_range(self):
-        value = simpledialog.askstring('Найти компьютеры', 'IP, диапазон, подсеть или список через запятую. До 512 адресов.\nПример: 192.168.22.1-192.168.22.32, 192.168.201.39', parent=self.window)
+        value = simpledialog.askstring('Найти компьютеры', 'IP, диапазон, подсеть или список через запятую. До 512 адресов.\nПример: 172.22.42.1-172.22.42.32, 172.22.87.55', parent=self.window)
         if value is None:
             return
         try:

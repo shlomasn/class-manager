@@ -982,16 +982,26 @@ def detect_local_networks():
         raise RuntimeError('Не удалось прочитать локальные сети. Используйте ручной диапазон IP.') from None
 
 
-def automatic_scan_plan(row, part=None, exclude=()):
+def automatic_scan_plan(row, part=None, exclude=(), *, target_ip=None):
     network = ipaddress.IPv4Network(row['network'])
-    # A large real subnet is explicitly divided into /24 blocks, never silently scanned in full.
+    # A large real subnet is explicitly divided into /24 blocks.
     parts = 2 ** (24 - network.prefixlen) if network.prefixlen < 23 else 1
-    default = (int(ipaddress.IPv4Address(row['ip'])) - int(network.network_address)) // 256 + 1 if parts > 1 else 1
+    target = ipaddress.IPv4Address(target_ip if target_ip is not None else row['ip'])
+    if target not in network:
+        raise ValueError(f'Введите IP из выбранной сети {network}')
+    default = (int(target) - int(network.network_address)) // 256 + 1 if parts > 1 else 1
     part = default if part is None else part
     if type(part) is not int or not 1 <= part <= parts:
         raise ValueError('Выберите допустимый номер части сети')
     selected = ipaddress.IPv4Network((int(network.network_address) + (part - 1) * 256, 24)) if parts > 1 else network
-    addresses = [ip for ip in parse_addresses(str(selected)) if ip not in set(exclude) | {row['ip']}]
+    excluded = set(exclude) | {row['ip']}
+    if parts > 1:
+        # The /24 is just a search window. Its .0 and .255 may be valid in the real subnet.
+        candidates = (ip for ip in selected
+                      if ip != network.network_address and ip != network.broadcast_address)
+        addresses = [school_ip(str(ip)) for ip in candidates if str(ip) not in excluded]
+    else:
+        addresses = [ip for ip in parse_addresses(str(selected)) if ip not in excluded]
     return dict(network=str(selected), addresses=addresses, parts=parts, part=part, partial=parts > 1)
 
 
